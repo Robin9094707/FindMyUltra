@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1286,153 +1286,155 @@ AIRPODS_ROLES = ("left", "right", "case")
 
 
 class OnlineDevices:
-    """Fragt die Online-Standorte der Apple-Geräte über den FMIP-Dienst ab
-    (gleiche Apple-Anmeldung wie für die Offline-Berichte, Token „mmeFMIPToken“)."""
+    """
+    Online-Ortung der Apple-Geräte über den Web-Dienst von iCloud.com („Geräte suchen“)
+    mit der Bibliothek pyicloud (wird bei Bedarf automatisch installiert).
+
+    * Einmalig verbinden: Apple-ID + Passwort (Standard: aus der Apple-Anmeldung des Servers),
+      dann 2FA-Code bestätigen. Danach bleibt die Sitzung über Cookies vertrauenswürdig
+      (data/icloud), ohne dass das Passwort erneut gesendet werden muss.
+    * Schutz vor Konto-Sperren: Das Passwort wird nie automatisch wiederholt gesendet;
+      nach Fehlern wird die Abfrage stark gedrosselt.
+    """
+
+    MIN_INTERVAL = 30
 
     def __init__(self, st: "State") -> None:
         self.st = st
-        self.host = "fmipmobile.icloud.com"
+        self.api: Any = None
+        self.state = "disconnected"        # disconnected | needs_2fa | connected | connecting
+        self.account: str | None = st.store.kv_get("icloud_account")
+        self.delivery: str | None = None   # trusted_device | sms
         self.error: str | None = None
         self.last_refresh: float | None = None
+        self.last_attempt = 0.0
         self.failures = 0
         self.event = asyncio.Event()
         self.lock = asyncio.Lock()
-        self.force_ipv4 = bool(st.store.kv_get("fmip_ipv4", False))
-        self.http4: ClientSession | None = None
-        self.udid = st.store.kv_get("fmip_udid") or secrets.token_hex(20)
-        st.store.kv_set("fmip_udid", self.udid)
+        self.cookie_dir = DATA_DIR / "icloud"
 
+    # --- Status -------------------------------------------------------------------
     def status(self) -> dict:
         cfg = self.st.store.settings()["online_devices"]
         return {"enabled": bool(cfg.get("enabled")), "interval": cfg.get("interval"),
+                "state": self.state, "account": self.account, "delivery": self.delivery,
                 "error": self.error, "last_refresh": self.last_refresh}
 
-    def _creds(self, scheme: str) -> tuple[str, str, str]:
-        """Liefert (Pfad-ID, Benutzer, Geheimnis) für das Auth-Schema."""
-        acc = self.st.apple.account
-        if scheme == "UserIdGuest":
-            user, pw = getattr(acc, "_username", None), getattr(acc, "_password", None)
-            if not user or not pw:
-                raise PermissionError("Keine Apple-ID/Passwort in der Sitzung gespeichert.")
-            return user, user, pw
-        data = getattr(acc, "_login_state_data", {}) or {}
-        dsid = str(data.get("dsid") or "")
-        tokens = (data.get("mobileme_data") or {}).get("tokens") or {}
-        tok = tokens.get("mmeFMIPToken") or tokens.get("mmeFMIPAppToken") or tokens.get("mmeAuthToken")
-        if not dsid or not tok:
-            raise PermissionError("Kein FMIP-Token in der Apple-Sitzung.")
-        return dsid, dsid, tok
+    def _publish(self) -> None:
+        self.st.hub.publish("apple_devices", {"changed": True})
 
-    async def _refresh_tokens(self) -> None:
-        """Tokens korrekt erneuern (LOGGED_IN → AUTHENTICATED → LOGGED_IN), wie FindMy.py bei 401."""
-        from findmy import LoginState
-        acc = self.st.apple.account
-        async with self.st.apple.lock:
-            state = await acc._gsa_authenticate()
-            if state != LoginState.AUTHENTICATED:
-                raise PermissionError(f"Token-Erneuerung nicht möglich (Status {state}).")
-            await acc._login_mobileme()
-            self.st.apple.save()
-
-    async def _post(self, path: str, body: dict) -> dict:
-        """Probiert die Anmeldearten nacheinander und merkt sich die funktionierende."""
-        preferred = self.st.store.kv_get("fmip_scheme") or "Forever"
-        order = [preferred] + [x for x in ("Forever", "UserIdGuest") if x != preferred]
-        last: Exception | None = None
-        refreshed = False
-        for scheme in order:
-            for attempt in range(2):
-                try:
-                    res = await self._post_scheme(scheme, path, body)
-                    if scheme != preferred:
-                        self.st.store.kv_set("fmip_scheme", scheme)
-                        log.info("Online-Ortung: Anmeldeart „%s“ funktioniert.", scheme)
-                    return res
-                except PermissionError as e:
-                    last = e
-                    log.info("Online-Ortung: %s abgelehnt (%s).", scheme, e)
-                    if scheme == "Forever" and attempt == 0 and not refreshed:
-                        refreshed = True
-                        try:
-                            await self._refresh_tokens()
-                            continue
-                        except Exception as re_:  # noqa: BLE001
-                            log.info("Token-Erneuerung fehlgeschlagen: %s", re_)
-                    break
-        raise last or PermissionError("Online-Abfrage abgelehnt")
-
-    async def _post_scheme(self, scheme: str, path: str, body: dict) -> dict:
-        import aiohttp
-        pid, user, secret = self._creds(scheme)
-        dsid, tok = pid, secret
-        headers = {
-            "X-Apple-Realm-Support": "1.0",
-            "X-Apple-Find-Api-Ver": "3.0",
-            "X-Apple-AuthScheme": scheme,
-            "Authorization": "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode(),
-            "User-Agent": "FindMyiPhone/500 CFNetwork/1568.100.1 Darwin/24.0.0",
-            "Accept-Language": "de-DE",
-            "Content-Type": "application/json",
-        }
-        with contextlib.suppress(Exception):
-            headers.update(await self.st.apple.account.get_anisette_headers())
-        try:
-            return await self._post_with(await self._session(self.force_ipv4), path, body, headers, dsid, tok)
-        except aiohttp.ClientConnectorError as e:
-            if self.force_ipv4:
-                raise
-            # Häufig: Netz liefert IPv6-Adresse, Server hat aber kein IPv6 → nur IPv4 versuchen
-            log.info("FMIP über Standardverbindung nicht erreichbar (%s) – versuche IPv4.", e)
-            res = await self._post_with(await self._session(True), path, body, headers, dsid, tok)
-            self.force_ipv4 = True
-            self.st.store.kv_set("fmip_ipv4", True)
-            return res
-
-    async def _session(self, ipv4: bool) -> ClientSession:
-        import aiohttp
-        if not ipv4:
-            return await self.st.notifier.session()
-        if self.http4 is None or self.http4.closed:
-            self.http4 = ClientSession(timeout=ClientTimeout(total=25),
-                                       connector=aiohttp.TCPConnector(family=socket.AF_INET),
-                                       headers={"User-Agent": f"FindMyUltra/{VERSION}"})
-        return self.http4
-
+    # --- pyicloud laden ------------------------------------------------------------
     @staticmethod
-    def _apple_ssl() -> Any:
-        """Gleicher Trust-Store wie FindMy.py: System-CAs + Apples eigene Root-CA
-        (fehlt in vielen Linux-/certifi-Speichern → „unable to get local issuer certificate“)."""
+    def _ensure_lib() -> Any:
         try:
-            from findmy.util.tls import apple_trust_context
-            return apple_trust_context()
-        except Exception:  # noqa: BLE001  (ältere FindMy.py-Version)
-            return True
+            import pyicloud  # noqa: F401
+        except ImportError:
+            log.info("Installiere pyicloud (einmalig) …")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--prefer-binary", "pyicloud"],
+                           check=True, capture_output=True, timeout=600)
+        from pyicloud import PyiCloudService
+        return PyiCloudService
 
-    async def _post_with(self, s: ClientSession, path: str, body: dict, headers: dict,
-                         dsid: str, tok: str) -> dict:
-        import aiohttp
-        for _ in range(3):
-            url = f"https://{self.host}/fmipservice/device/{dsid}/{path}"
-            async with s.post(url, json=body, headers=headers, ssl=self._apple_ssl()) as r:
-                if r.status == 330 and r.headers.get("X-Apple-MMe-Host"):
-                    self.host = r.headers["X-Apple-MMe-Host"]
-                    continue
-                if r.status in (401, 403):
-                    detail = (await r.text())[:120].strip()
-                    raise PermissionError(f"Apple hat die Online-Abfrage abgelehnt ({r.status}"
-                                          f"{', ' + detail if detail else ''}).")
-                if r.status >= 400:
-                    raise RuntimeError(f"FMIP-Fehler {r.status}: {(await r.text())[:200]}")
-                return await r.json(content_type=None)
-        raise RuntimeError("Zu viele Umleitungen beim FMIP-Dienst")
+    def _default_creds(self) -> tuple[str | None, str | None]:
+        acc = getattr(self.st.apple, "account", None)
+        return getattr(acc, "_username", None), getattr(acc, "_password", None)
 
-    def _context(self) -> dict:
-        return {"clientContext": {
-            "appName": "FindMyiPhone", "appVersion": "7.0", "buildVersion": "1036",
-            "clientTimestamp": int(now() * 1000), "deviceUDID": self.udid, "inactiveTime": 1,
-            "osVersion": "18.0", "productType": "iPhone16,1", "fmly": True, "shouldLocate": True,
-            "selectedDevice": "all"}}
+    # --- Verbinden (einmalig mit 2FA) ---------------------------------------------
+    async def connect(self, apple_id: str | None = None, password: str | None = None) -> dict:
+        if self.st.args.demo:
+            raise ValueError("Im Demo-Modus nicht verfügbar")
+        uid, pw = self._default_creds()
+        apple_id = (apple_id or uid or "").strip()
+        password = password or pw
+        if not apple_id or not password:
+            raise ValueError("Apple-ID und Passwort angeben (oder zuerst den Apple-Account im Server anmelden).")
+        async with self.lock:
+            self.state, self.error = "connecting", None
+            self._publish()
+            try:
+                svc = await asyncio.to_thread(self._ensure_lib)
+                self.cookie_dir.mkdir(parents=True, exist_ok=True)
+                with contextlib.suppress(OSError):
+                    os.chmod(self.cookie_dir, 0o700)
+                api = await asyncio.to_thread(lambda: svc(apple_id, password, cookie_directory=str(self.cookie_dir),
+                                                          refresh_interval=None, with_family=True))
+                self.api, self.account = api, apple_id
+                self.st.store.kv_set("icloud_account", apple_id)
+                if api.requires_2fa:
+                    self.state = "needs_2fa"
+                    try:
+                        await asyncio.to_thread(api.request_2fa_code)
+                        self.delivery = getattr(api, "two_factor_delivery_method", None)
+                    except Exception as e:  # noqa: BLE001
+                        log.info("2FA-Anforderung: %s – ein bereits angezeigter Code funktioniert trotzdem.", e)
+                        with contextlib.suppress(Exception):
+                            api.use_existing_trusted_device_code()
+                else:
+                    await self._finish()
+            except Exception as e:  # noqa: BLE001
+                self.api, self.state = None, "disconnected"
+                self.error = self._friendly(e)
+                log.warning("iCloud-Verbindung fehlgeschlagen: %s", e)
+            self._publish()
+            return self.status()
 
+    async def request_sms(self) -> dict:
+        if not self.api:
+            raise ValueError("Zuerst verbinden")
+        await asyncio.to_thread(self.api._request_sms_2fa_code)
+        self.delivery = "sms"
+        return self.status()
+
+    async def submit_code(self, code: str) -> dict:
+        if not self.api or self.state != "needs_2fa":
+            raise ValueError("Keine 2FA-Anfrage offen – bitte erneut verbinden.")
+        async with self.lock:
+            ok = await asyncio.to_thread(self.api.validate_2fa_code, code.strip())
+            if not ok:
+                self.error = "Code falsch – bitte erneut eingeben."
+                return self.status()
+            if not self.api.is_trusted_session:
+                await asyncio.to_thread(self.api.trust_session)
+            await self._finish()
+            self._publish()
+            return self.status()
+
+    async def _finish(self) -> None:
+        self.state, self.error, self.failures, self.delivery = "connected", None, 0, None
+        log.info("iCloud-Online-Ortung verbunden (%s).", self.account)
+        self.event.set()
+
+    async def disconnect(self) -> None:
+        async with self.lock:
+            self.api, self.state, self.error = None, "disconnected", None
+            import shutil
+            shutil.rmtree(self.cookie_dir, ignore_errors=True)
+            self.st.store.kv_set("icloud_account", None)
+            self.account = None
+            self._publish()
+
+    async def resume(self) -> None:
+        """Beim Start: vertrauenswürdige Sitzung aus den Cookies wiederverwenden (ohne 2FA)."""
+        if self.st.args.demo or not self.account or not self.cookie_dir.exists():
+            return
+        uid, pw = self._default_creds()
+        if not pw or (uid and uid.lower() != self.account.lower()):
+            self.error = "Bitte Online-Ortung einmal neu verbinden."
+            return
+        try:
+            svc = await asyncio.to_thread(self._ensure_lib)
+            api = await asyncio.to_thread(lambda: svc(self.account, pw, cookie_directory=str(self.cookie_dir),
+                                                      refresh_interval=None, with_family=True))
+            if api.requires_2fa:
+                self.state, self.error = "disconnected", "Sitzung abgelaufen – bitte Online-Ortung neu verbinden (2FA)."
+                return
+            self.api = api
+            await self._finish()
+        except Exception as e:  # noqa: BLE001
+            self.state, self.error = "disconnected", self._friendly(e)
+            log.warning("iCloud-Sitzung nicht wiederherstellbar: %s", e)
+
+    # --- Abfrage --------------------------------------------------------------------
     @staticmethod
     def _parse(d: dict) -> dict:
         loc = d.get("location") or None
@@ -1451,55 +1453,67 @@ class OnlineDevices:
                 "battery_status": d.get("batteryStatus"), "device_status": str(d.get("deviceStatus") or ""),
                 "online": online}
 
-    async def refresh(self) -> int:
-        if self.st.args.demo:
+    def _fetch(self) -> list[dict]:
+        mgr = self.api.devices
+        mgr.refresh(locate=True)
+        return [self._parse(dict(dev.data)) for dev in mgr]
+
+    async def refresh(self, force: bool = False) -> int:
+        if self.st.args.demo or self.state != "connected" or self.api is None:
             return 0
-        if not self.st.apple.logged_in:
-            self.error = "Nicht bei Apple angemeldet"
+        if not force and now() - self.last_attempt < self.MIN_INTERVAL:
             return 0
         async with self.lock:
+            self.last_attempt = now()
             try:
-                j = await self._post("initClient", self._context())
-                items = [self._parse(d) for d in (j.get("content") or []) if d.get("id")]
+                items = await asyncio.wait_for(asyncio.to_thread(self._fetch), timeout=90)
                 for it in items:
                     self.st.store.apple_upsert_fmip(it)
-                self.error = None
-                self.failures = 0
-                self.last_refresh = now()
-                self.st.hub.publish("apple_devices", {"changed": True})
+                self.error, self.failures, self.last_refresh = None, 0, now()
+                self._publish()
                 return len(items)
             except Exception as e:  # noqa: BLE001
                 self.failures += 1
                 self.error = self._friendly(e)
                 log.warning("Online-Ortung fehlgeschlagen: %s (%s)", self.error, e)
+                name = type(e).__name__
+                if "Auth" in name or "Login" in name or "2FA" in name or "Token" in name:
+                    self.state = "disconnected"  # nicht automatisch mit Passwort neu anmelden
+                self._publish()
                 return 0
+
+    async def play_sound(self, aid: str) -> None:
+        if self.state != "connected" or self.api is None:
+            raise RuntimeError("Online-Ortung ist nicht verbunden")
+
+        def _do() -> None:
+            dev = next((d for d in self.api.devices if str(d.data.get("id")) == aid), None)
+            if dev is None:
+                raise RuntimeError("Gerät nicht gefunden")
+            dev.play_sound(subject="FindMy Ultra")
+        await asyncio.to_thread(_do)
 
     @staticmethod
     def _friendly(e: Exception) -> str:
-        import aiohttp
-        if isinstance(e, aiohttp.ClientConnectorCertificateError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
-            return ("Zertifikat von iCloud wurde nicht akzeptiert. Prüft deine Firewall HTTPS "
-                    "(TLS-Inspektion)? Dann fmipmobile.icloud.com / *.icloud.com davon ausnehmen.")
-        if isinstance(e, aiohttp.ClientConnectorError):
-            return ("Der Server erreicht iCloud („Wo ist?“) nicht – Netzwerk/Firewall/DNS prüfen. "
-                    "(IPv4 wurde bereits versucht.)")
-        if isinstance(e, asyncio.TimeoutError):
-            return "Zeitüberschreitung bei iCloud – später erneut versuchen."
-        if isinstance(e, PermissionError):
-            return "Apple hat die Online-Abfrage abgelehnt – Apple-Account ggf. neu anmelden."
-        return f"{type(e).__name__}: {e}"
-
-    async def play_sound(self, aid: str) -> None:
-        await self._post("playSound", {**self._context(), "device": aid,
-                                       "subject": "FindMy Ultra"})
+        n = type(e).__name__
+        if "AccountLocked" in n:
+            return "Apple hat den Account vorübergehend gesperrt – bitte später erneut verbinden."
+        if "FailedLogin" in n or "Password" in n:
+            return "Apple-ID oder Passwort falsch."
+        if "Connection" in n or isinstance(e, (OSError, asyncio.TimeoutError)):
+            return "iCloud nicht erreichbar – Netzwerk/Firewall prüfen (idmsa.apple.com, *.icloud.com)."
+        if "ServiceUnavailable" in n:
+            return "„Wo ist?“ ist für diesen Account nicht verfügbar."
+        return f"{n}: {e}"
 
     async def loop(self) -> None:
         await asyncio.sleep(5)
+        await self.resume()
         while True:
             cfg = self.st.store.settings()["online_devices"]
-            if cfg.get("enabled") and self.st.apple.logged_in:
+            if cfg.get("enabled") and self.state == "connected":
                 await self.refresh()
-            wait = max(30, int(cfg.get("interval", 120))) * min(2 ** self.failures, 16)
+            wait = max(self.MIN_INTERVAL, int(cfg.get("interval", 120))) * min(2 ** self.failures, 16)
             self.event.clear()
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.event.wait(), timeout=wait)
@@ -2704,7 +2718,7 @@ def build_app(st: State) -> web.Application:
 
     async def apple_refresh(req: web.Request) -> web.Response:
         b = await req.json() if req.can_read_body else {}
-        n = await st.online.refresh() if st.online and not st.args.demo else 0
+        n = await st.online.refresh(force=True) if st.online and not st.args.demo else 0
         linked = [did for d in st.store.apple_rows() for did in (d.get("links") or {}).values()]
         aid = b.get("id")
         if aid:
@@ -2728,6 +2742,25 @@ def build_app(st: State) -> web.Application:
         except Exception as e:  # noqa: BLE001
             return jerr(502, f"Ton fehlgeschlagen: {e}")
         return web.json_response({"ok": True})
+
+    async def icloud_connect(req: web.Request) -> web.Response:
+        b = await req.json() if req.can_read_body else {}
+        return web.json_response(await st.online.connect(b.get("apple_id"), b.get("password")))
+
+    async def icloud_sms(_: web.Request) -> web.Response:
+        return web.json_response(await st.online.request_sms())
+
+    async def icloud_code(req: web.Request) -> web.Response:
+        b = await req.json()
+        res = await st.online.submit_code(str(b.get("code", "")))
+        if res["state"] == "connected":
+            await st.online.refresh(force=True)
+            res = st.online.status()
+        return web.json_response(res)
+
+    async def icloud_disconnect(_: web.Request) -> web.Response:
+        await st.online.disconnect()
+        return web.json_response(st.online.status())
 
     async def new_since(req: web.Request) -> web.Response:
         """Neue Berichte je Objekt seit Zeitpunkt X (nach Eingang beim Server)."""
@@ -2901,6 +2934,10 @@ def build_app(st: State) -> web.Application:
     r.add_post("/api/apple-devices/{id}/offline", apple_offline_import)
     r.add_delete("/api/apple-devices/{id}/offline/{role}", apple_offline_remove)
     r.add_post("/api/apple-devices/{id}/sound", apple_sound)
+    r.add_post("/api/icloud/connect", icloud_connect)
+    r.add_post("/api/icloud/2fa/sms", icloud_sms)
+    r.add_post("/api/icloud/2fa/submit", icloud_code)
+    r.add_post("/api/icloud/disconnect", icloud_disconnect)
     r.add_get("/api/devices/{id}/keys", device_export_keys)
     r.add_get("/api/reports", all_reports)
     r.add_post("/api/import", import_keys)
@@ -3239,7 +3276,7 @@ async def amain(args: argparse.Namespace) -> None:
         print("\n  Erstes Passwort: siehe data/ERSTES-PASSWORT.txt")
     if not args.demo:
         a = st.apple.status()
-        print(f"\n  Apple: {'✅ ' + str(a.get('account_name')) if a['state'] == 'logged_in' else '❌ nicht angemeldet – in der App einrichten'}")
+        print(f"\n  Apple: {'✅ ' + str(a.get('account_name') or 'angemeldet') if a['state'] == 'logged_in' else '❌ nicht angemeldet – in der App einrichten'}")
         print(f"  Geräte mit Schlüsseln: {len(st.registry.tracked)}")
     print("═" * 64 + "\n")
 

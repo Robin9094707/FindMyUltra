@@ -92,10 +92,30 @@ struct SourceBadge: View {
 struct DevicesTabView: View {
     @Environment(AppModel.self) private var model
     @State private var showAdd = false
+    @State private var showConnect = false
 
     var body: some View {
         List {
-            if let st = model.onlineStatus, let e = st.error, st.enabled {
+            if let st = model.onlineStatus, st.enabled, st.state != nil, !st.isConnected {
+                Section {
+                    Button { Haptics.light(); showConnect = true } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "icloud.fill").font(.title2).foregroundStyle(.white)
+                                .frame(width: 44, height: 44).background(Color.blue.gradient, in: .circle)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(st.state == "needs_2fa" ? "Bestätigungscode eingeben" : "Online-Ortung verbinden")
+                                    .font(.headline)
+                                Text(st.error ?? "Einmalig mit iCloud verbinden (2FA), um iPhone, iPad, Mac, Watch & AirPods live zu orten.")
+                                    .font(.caption).foregroundStyle(st.error == nil ? Color.secondary : Color.orange)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.blue.opacity(0.1))
+                }
+            } else if let st = model.onlineStatus, let e = st.error, st.enabled {
                 Section {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
@@ -163,6 +183,10 @@ struct DevicesTabView: View {
         .sheet(isPresented: $showAdd) {
             NavigationStack { AddAppleDeviceView() }
                 .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showConnect) {
+            NavigationStack { ICloudConnectView() }
+                .presentationDetents([.large])
         }
         .task { await model.reloadAppleDevices() }
     }
@@ -597,5 +621,106 @@ struct AppleDeviceDetailView: View {
             Haptics.warning()
             model.showToast("⚠️ \(error.localizedDescription)")
         }
+    }
+}
+
+// MARK: - iCloud-Online-Ortung verbinden (einmalig, mit 2FA)
+
+struct ICloudConnectView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var appleID = ""
+    @State private var password = ""
+    @State private var code = ""
+    @State private var busy = false
+    @State private var info: String?
+
+    private var st: OnlineStatus? { model.onlineStatus }
+
+    var body: some View {
+        Form {
+            Section {
+                VStack(spacing: 10) {
+                    Image(systemName: "icloud.fill").font(.system(size: 44)).foregroundStyle(.blue)
+                    Text("Online-Ortung").font(.title2.bold())
+                    Text("Verbindet den Server einmalig mit iCloud „Geräte suchen“. Danach bleibt die Sitzung vertrauenswürdig – kein Code bei jedem Abruf.")
+                        .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 6)
+                .listRowBackground(Color.clear)
+            }
+            if st?.state == "needs_2fa" {
+                Section {
+                    TextField("6-stelliger Code", text: $code)
+                        .keyboardType(.numberPad).textContentType(.oneTimeCode)
+                        .font(.title2.monospacedDigit())
+                    Button(busy ? "Prüfe …" : "Bestätigen") { Task { await submit() } }
+                        .disabled(code.count < 6 || busy)
+                    Button("Code per SMS senden") { Task { await sms() } }.disabled(busy)
+                } header: {
+                    Text("Bestätigungscode")
+                } footer: {
+                    Text(st?.delivery == "sms" ? "Der Code wurde per SMS gesendet." :
+                         "Der Code erscheint auf deinen Apple-Geräten (ggf. zuerst „Erlauben“ tippen).")
+                }
+            } else {
+                Section {
+                    TextField("Apple-ID (leer = wie beim Server-Login)", text: $appleID)
+                        .textContentType(.username).keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    SecureField("Passwort (leer = gespeichertes)", text: $password)
+                        .textContentType(.password)
+                    Button(busy ? "Verbinde …" : "Verbinden") { Task { await connect() } }.disabled(busy)
+                } footer: {
+                    Text("Das Passwort wird nur einmal zum Verbinden gesendet und nicht automatisch wiederholt – so wird dein Account nicht gesperrt.")
+                }
+            }
+            if let e = st?.error { Section { Text(e).foregroundStyle(.orange) } }
+            if let info { Section { Text(info).foregroundStyle(.green) } }
+        }
+        .navigationTitle("iCloud verbinden")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Schließen") { dismiss() } } }
+        .onAppear { appleID = st?.account ?? "" }
+        .disabled(busy)
+    }
+
+    private func apply(_ s: OnlineStatus) async {
+        model.onlineStatus = s
+        if s.isConnected {
+            Haptics.success()
+            info = "Verbunden – Geräte werden geladen."
+            await model.reloadAppleDevices()
+            dismiss()
+        }
+    }
+
+    private func connect() async {
+        busy = true; defer { busy = false }
+        var body: [String: Any] = [:]
+        if !appleID.isEmpty { body["apple_id"] = appleID }
+        if !password.isEmpty { body["password"] = password }
+        do {
+            let s: OnlineStatus = try await model.api!.send("POST", "/api/icloud/connect", json: body, timeout: 120)
+            password = ""
+            if s.state == "needs_2fa" { Haptics.light() } else if s.error != nil { Haptics.warning() }
+            await apply(s)
+        } catch { Haptics.warning(); model.showToast("⚠️ \(error.localizedDescription)") }
+    }
+
+    private func sms() async {
+        busy = true; defer { busy = false }
+        if let s: OnlineStatus = try? await model.api!.send("POST", "/api/icloud/2fa/sms") {
+            model.onlineStatus = s; Haptics.light()
+        }
+    }
+
+    private func submit() async {
+        busy = true; defer { busy = false }
+        do {
+            let s: OnlineStatus = try await model.api!.send("POST", "/api/icloud/2fa/submit", json: ["code": code], timeout: 120)
+            if !s.isConnected { Haptics.warning(); code = "" }
+            await apply(s)
+        } catch { Haptics.warning(); model.showToast("⚠️ \(error.localizedDescription)") }
     }
 }

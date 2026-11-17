@@ -270,8 +270,12 @@ struct AppleDevice: Codable, Identifiable, Hashable {
 struct OnlineStatus: Codable, Hashable {
     var enabled: Bool
     var interval: Int?
+    var state: String?
+    var account: String?
+    var delivery: String?
     var error: String?
     var lastRefresh: Double?
+    var isConnected: Bool { state == "connected" }
 }
 
 struct AppleDevicesEnvelope: Codable {

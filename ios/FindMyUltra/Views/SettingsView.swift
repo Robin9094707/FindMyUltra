@@ -242,6 +242,23 @@ struct SettingsView: View {
                 Picker("Abfrage alle", selection: od.interval) {
                     ForEach([60, 120, 300, 600, 1800], id: \.self) { Text(secs($0)).tag($0) }
                 }
+                if let st = model.onlineStatus {
+                    HStack {
+                        Text("iCloud")
+                        Spacer()
+                        Text(st.isConnected ? (st.account ?? "verbunden") : "nicht verbunden")
+                            .foregroundStyle(st.isConnected ? Color.green : Color.secondary).lineLimit(1)
+                    }
+                    if st.isConnected {
+                        Button("iCloud-Verbindung trennen", role: .destructive) {
+                            Task {
+                                if let s: OnlineStatus = try? await model.api?.send("POST", "/api/icloud/disconnect") {
+                                    model.onlineStatus = s; Haptics.light()
+                                }
+                            }
+                        }
+                    }
+                }
                 if let e = model.onlineStatus?.error { Text(e).font(.footnote).foregroundStyle(.orange) }
             } header: {
                 Text("Apple-Geräte")
