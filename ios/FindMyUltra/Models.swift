@@ -18,6 +18,13 @@ struct Report: Codable, Identifiable, Hashable {
     let batchId: String?
     let batchSize: Int?
     let late: Int
+    // nur bei Aufzeichnungen von Apple-Geräten
+    var source: String? = nil
+    var role: String? = nil
+    var positionType: String? = nil
+    var batteryLevel: Double? = nil
+
+    var isOnline: Bool { source == "online" }
 
     var date: Date { Date(timeIntervalSince1970: ts) }
     var receivedDate: Date { Date(timeIntervalSince1970: receivedAt) }
@@ -181,6 +188,8 @@ struct AppleDevicePart: Codable, Hashable, Identifiable {
     var deviceId: String
     var name: String?
     var last: Report?
+    var battery: String?
+    var batteryTs: Double?
     var total: Int
     var id: String { role }
 }
@@ -214,6 +223,62 @@ enum PartRole: String, CaseIterable, Identifiable {
     }
 }
 
+struct CaseAlert: Codable, Hashable { var enabled: Bool; var level: String }
+struct CaseConfig: Codable, Hashable {
+    var windowMin: Double
+    var alertOut: CaseAlert
+    var alertIn: CaseAlert
+    var once: Bool
+}
+struct AppleSettings: Codable, Hashable {
+    var caseConfig: CaseConfig
+    enum CodingKeys: String, CodingKey { case caseConfig = "case" }
+}
+struct BudState: Codable, Hashable {
+    var state: String
+    var since: Double?
+    var reason: String
+}
+struct CaseStatus: Codable, Hashable {
+    var left: BudState?
+    var right: BudState?
+    var summary: String
+    var estimated: Bool?
+}
+
+/// Aufzeichnung (Session) des Standortverlaufs eines Apple-Geräts.
+struct Recording: Codable, Identifiable, Hashable {
+    var id: Int
+    var appleId: String
+    var name: String
+    var source: String
+    var startTs: Double
+    var endTs: Double?
+    var stoppedTs: Double?
+    var active: Bool
+    var effectiveEnd: Double?
+    var points: Int?
+    var onlinePoints: Int?
+    var offlinePoints: Int?
+    var lastTs: Double?
+    var start: Date { Date(timeIntervalSince1970: startTs) }
+    var sourceLabel: String {
+        switch source {
+        case "online": "Nur online"
+        case "offline": "Nur offline"
+        default: "Online + Offline"
+        }
+    }
+}
+struct RecordingsEnvelope: Codable { var sessions: [Recording] }
+struct RecordingPoints: Codable {
+    var session: Recording
+    var points: [Report]
+    var stays: [Stay]
+    var places: [Place]
+    var totalStayTime: Double
+}
+
 struct AppleDevice: Codable, Identifiable, Hashable {
     let id: String
     var kind: String
@@ -232,6 +297,11 @@ struct AppleDevice: Codable, Identifiable, Hashable {
     var parts: [AppleDevicePart]
     var best: BestLocation?
     var reachable: Bool?
+    var settings: AppleSettings?
+    var caseStatus: CaseStatus?
+    var activeSession: Recording?
+    var sessionsCount: Int?
+    var onlinePoints: Int?
 
     var isAirPods: Bool { mode == "airpods" }
     var isCloud: Bool { kind == "fmip" }

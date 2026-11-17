@@ -38,6 +38,7 @@ enum SheetSection: String, CaseIterable, Identifiable {
 struct DeviceRoute: Hashable {
     let id: String
     var apple: Bool = false
+    var recording: Bool = false
 }
 
 enum CircleMode: String, CaseIterable, Identifiable {
@@ -77,6 +78,68 @@ final class AppModel {
         didSet { UserDefaults.standard.set(showAppleOnMap, forKey: "showAppleOnMap") }
     }
     private var appleReloadTask: Task<Void, Never>?
+
+    // Aufzeichnungen (Standortverlauf von Apple-Geräten)
+    var recordings: [String: [Recording]] = [:]
+    var focusedRecordingID: Int?
+    var recording: Recording?
+    private var recordingReloadTask: Task<Void, Never>?
+
+    /// Farbe der aktuell angezeigten Spur (Objekt-Verlauf oder Aufzeichnung).
+    var trackTint: Color? {
+        if let id = focusedID, let d = device(id) { return d.tint }
+        if focusedRecordingID != nil { return .blue }
+        return nil
+    }
+
+    func loadRecordings(_ aid: String) async {
+        guard let api else { return }
+        if let r: RecordingsEnvelope = try? await api.get("/api/apple-devices/\(APIClient.seg(aid))/sessions") {
+            recordings[aid] = r.sessions
+        }
+    }
+
+    func openRecording(_ id: Int) {
+        Haptics.selection()
+        sheetPath.append(DeviceRoute(id: String(id), recording: true))
+        if detent == .peek { detent = .medium }
+    }
+
+    func loadRecording(_ sid: Int, fit: Bool) async {
+        guard let api else { return }
+        focusedID = nil
+        focusedRecordingID = sid
+        guard let r: RecordingPoints = try? await api.get("/api/sessions/\(sid)/points"),
+              focusedRecordingID == sid else { return }
+        let wasAtEnd = cursor == nil || cursor == track.count - 1
+        recording = r.session
+        track = r.points
+        withAnimation(.smooth) {
+            stays = r.stays
+            places = r.places
+            totalStayTime = r.totalStayTime
+        }
+        historyVisible = true
+        if fit || wasAtEnd { cursor = r.points.isEmpty ? nil : r.points.count - 1 }
+        if fit { fitTrack() }
+    }
+
+    func leaveRecording() {
+        focusedRecordingID = nil
+        recording = nil
+        track = []; cursor = nil
+        stays = []; places = []; totalStayTime = 0; selectedStayID = nil
+        historyVisible = false
+    }
+
+    func scheduleRecordingReload() {
+        guard let sid = focusedRecordingID else { return }
+        recordingReloadTask?.cancel()
+        recordingReloadTask = Task {
+            try? await Task.sleep(for: .seconds(1.2))
+            if !Task.isCancelled { await loadRecording(sid, fit: false) }
+        }
+    }
     var status: ServerStatus?
     var settings: ServerSettings?
     var me: MeInfo?
@@ -450,6 +513,8 @@ final class AppModel {
     }
 
     func clearFocus() {
+        focusedRecordingID = nil
+        recording = nil
         focusedAppleID = nil
         focusedID = nil
         track = []
@@ -567,6 +632,10 @@ final class AppModel {
 
     func handle(url: URL) {
         guard url.scheme == "findmyultra" else { return }
+        if url.host == "apple" {
+            let id = url.pathComponents.dropFirst().first ?? ""
+            if !id.isEmpty { openApple(id.removingPercentEncoding ?? id) }
+        }
         if url.host == "device" {
             let id = url.pathComponents.dropFirst().first ?? ""
             if !id.isEmpty { openDevice(id) }
@@ -641,6 +710,7 @@ final class AppModel {
                 }
                 if appleDevices.contains(where: { $0.parts.contains { $0.deviceId == r.deviceId } }) {
                     scheduleAppleReload()
+                    scheduleRecordingReload()
                 }
                 if r.deviceId == focusedID {
                     let atEnd = cursor == nil || cursor == track.count - 1
@@ -655,6 +725,7 @@ final class AppModel {
             }
         case "apple_devices":
             scheduleAppleReload()
+            scheduleRecordingReload()
         case "settings":
             if let s = try? api.decoder.decode(ServerSettings.self, from: data) { settings = s }
         case "notification":

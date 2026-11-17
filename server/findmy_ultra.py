@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -236,6 +236,15 @@ DEFAULT_ALERTS: dict = {
     "battery": {"enabled": True, "level": "active"},
 }
 
+DEFAULT_APPLE_SETTINGS: dict = {
+    "case": {                      # AirPods: Case-Erkennung (geschätzt aus Offline-Ortungen)
+        "window_min": 20,          # Ohrhörer gilt als „draußen“, wenn er so frisch geortet wurde
+        "alert_out": {"enabled": False, "level": "timeSensitive"},
+        "alert_in": {"enabled": False, "level": "active"},
+        "once": False,             # True: jede Richtung nur einmal, bis neu scharf geschaltet
+    },
+}
+
 DEFAULT_LOST: dict = {"enabled": False, "since": None, "message": "", "phone": "",
                       "level": "critical", "notify_every_report": True}
 
@@ -332,6 +341,29 @@ CREATE TABLE IF NOT EXISTS apple_devices (
     updated_at    REAL,
     added_at      REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS online_reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    apple_id     TEXT NOT NULL,
+    ts           REAL NOT NULL,
+    lat          REAL NOT NULL,
+    lon          REAL NOT NULL,
+    accuracy     INTEGER,
+    position_type TEXT,
+    battery_level REAL,
+    received_at  REAL NOT NULL,
+    UNIQUE(apple_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_online_dev_ts ON online_reports(apple_id, ts);
+CREATE TABLE IF NOT EXISTS recordings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    apple_id    TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'both',   -- both | offline | online
+    start_ts    REAL NOT NULL,
+    end_ts      REAL,                           -- geplantes Ende (optional)
+    stopped_ts  REAL,                           -- tatsächlich beendet
+    created     REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     k  TEXT PRIMARY KEY,
     v  TEXT NOT NULL
@@ -349,6 +381,11 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(devices)")}
         if "category" not in cols:
             self.db.execute("ALTER TABLE devices ADD COLUMN category TEXT NOT NULL DEFAULT 'item'")
+        acols = {r[1] for r in self.db.execute("PRAGMA table_info(apple_devices)")}
+        if "settings" not in acols:
+            self.db.execute("ALTER TABLE apple_devices ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")
+        if "state" not in acols:
+            self.db.execute("ALTER TABLE apple_devices ADD COLUMN state TEXT NOT NULL DEFAULT '{}'")
         self.db.commit()
 
     # kv / settings ----------------------------------------------------------
@@ -455,9 +492,53 @@ class Store:
             d = dict(r)
             d["online"] = json.loads(d["online"]) if d.get("online") else None
             d["links"] = json.loads(d.get("links") or "{}")
+            d["settings"] = deep_merge(DEFAULT_APPLE_SETTINGS, json.loads(d.get("settings") or "{}"))
+            d["state"] = json.loads(d.get("state") or "{}")
             d["hidden"] = bool(d["hidden"])
             out.append(d)
         return out
+
+    # Online-Verlauf & Aufzeichnungen ------------------------------------------------
+    def add_online_report(self, aid: str, on: dict, battery: float | None) -> None:
+        self.db.execute("INSERT OR IGNORE INTO online_reports(apple_id,ts,lat,lon,accuracy,position_type,"
+                        "battery_level,received_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (aid, on["ts"], on["lat"], on["lon"], on.get("accuracy"), on.get("position_type"),
+                         battery, now()))
+        self.db.commit()
+
+    @staticmethod
+    def _recording(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        t = now()
+        d["active"] = d["stopped_ts"] is None and (d["end_ts"] is None or d["end_ts"] > t)
+        d["effective_end"] = d["stopped_ts"] or (d["end_ts"] if d["end_ts"] and d["end_ts"] <= t else None)
+        return d
+
+    def recordings(self, aid: str | None = None) -> list[dict]:
+        if aid:
+            rows = self.db.execute("SELECT * FROM recordings WHERE apple_id=? ORDER BY start_ts DESC", (aid,))
+        else:
+            rows = self.db.execute("SELECT * FROM recordings ORDER BY start_ts DESC")
+        return [self._recording(r) for r in rows.fetchall()]
+
+    def recording(self, sid: int) -> dict | None:
+        r = self.db.execute("SELECT * FROM recordings WHERE id=?", (sid,)).fetchone()
+        return self._recording(r) if r else None
+
+    def add_recording(self, aid: str, name: str, source: str, end_ts: float | None) -> int:
+        cur = self.db.execute("INSERT INTO recordings(apple_id,name,source,start_ts,end_ts,created) "
+                              "VALUES(?,?,?,?,?,?)", (aid, name, source, now(), end_ts, now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def update_recording(self, sid: int, **f: Any) -> None:
+        if f:
+            self.db.execute(f"UPDATE recordings SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), sid))
+            self.db.commit()
+
+    def delete_recording(self, sid: int) -> None:
+        self.db.execute("DELETE FROM recordings WHERE id=?", (sid,))
+        self.db.commit()
 
     def apple_row(self, aid: str) -> dict | None:
         return next((d for d in self.apple_rows(True) if d["id"] == aid), None)
@@ -500,7 +581,7 @@ class Store:
             return
         cols, vals = [], []
         for k, v in fields.items():
-            if k in ("links", "online"):
+            if k in ("links", "online", "settings", "state") and not isinstance(v, str):
                 v = json.dumps(v) if v is not None else None
             if k == "hidden":
                 v = int(bool(v))
@@ -566,12 +647,34 @@ class Store:
     def purge(self, settings: dict) -> int:
         removed = 0
         default = int(settings.get("retention_days") or 0)
+        # Zeiträume von Aufzeichnungen bleiben unabhängig von der Aufbewahrung erhalten
+        protect: dict[str, list[tuple[float, float]]] = {}
+        for a in self.apple_rows(True):
+            for se in self.recordings(a["id"]):
+                rng = (se["start_ts"] - 3600, (se["effective_end"] or now()) + 3600)
+                protect.setdefault(a["id"], []).append(rng)
+                for did in a["links"].values():
+                    protect.setdefault(did, []).append(rng)
+
+        def guard(key: str) -> tuple[str, list]:
+            sql, args = "", []
+            for lo, hi in protect.get(key, []):
+                sql += " AND NOT (ts BETWEEN ? AND ?)"
+                args += [lo, hi]
+            return sql, args
+
         for d in self.db.execute("SELECT id, retention_days FROM devices").fetchall():
             days = d["retention_days"] if d["retention_days"] is not None else default
             if days and days > 0:
-                cur = self.db.execute("DELETE FROM reports WHERE device_id=? AND ts<?",
-                                      (d["id"], now() - days * 86400))
+                g, ga = guard(d["id"])
+                cur = self.db.execute("DELETE FROM reports WHERE device_id=? AND ts<?" + g,
+                                      (d["id"], now() - days * 86400, *ga))
                 removed += cur.rowcount
+        if default > 0:
+            for a in self.db.execute("SELECT DISTINCT apple_id FROM online_reports").fetchall():
+                g, ga = guard(a[0])
+                self.db.execute("DELETE FROM online_reports WHERE apple_id=? AND ts<?" + g,
+                                (a[0], now() - default * 86400, *ga))
         self.db.execute("DELETE FROM notifications WHERE ts<?", (now() - 60 * 86400,))
         self.db.execute("DELETE FROM polls WHERE id NOT IN (SELECT id FROM polls ORDER BY id DESC LIMIT 3000)")
         self.db.commit()
@@ -1469,6 +1572,8 @@ class OnlineDevices:
                 items = await asyncio.wait_for(asyncio.to_thread(self._fetch), timeout=90)
                 for it in items:
                     self.st.store.apple_upsert_fmip(it)
+                    if it.get("online") and it["online"].get("ts"):
+                        self.st.store.add_online_report(it["id"], it["online"], it.get("battery_level"))
                 self.error, self.failures, self.last_refresh = None, 0, now()
                 self._publish()
                 return len(items)
@@ -1514,6 +1619,10 @@ class OnlineDevices:
             if cfg.get("enabled") and self.state == "connected":
                 await self.refresh()
             wait = max(self.MIN_INTERVAL, int(cfg.get("interval", 120))) * min(2 ** self.failures, 16)
+            # Laufende Aufzeichnung mit Online-Quelle → häufiger abfragen
+            if not self.failures and any(se["active"] and se["source"] in ("online", "both")
+                                         for se in self.st.store.recordings()):
+                wait = min(wait, 60)
             self.event.clear()
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.event.wait(), timeout=wait)
@@ -1526,8 +1635,11 @@ def apple_device_public(st: "State", d: dict) -> dict:
         last = st.store.db.execute("SELECT * FROM reports WHERE device_id=? ORDER BY ts DESC LIMIT 1",
                                    (did,)).fetchone()
         dev = st.store.device_row(did)
+        bat = st.store.db.execute("SELECT battery, ts FROM reports WHERE device_id=? AND battery IS NOT NULL "
+                                  "ORDER BY ts DESC LIMIT 1", (did,)).fetchone()
         parts.append({"role": role, "device_id": did, "name": dev["name"] if dev else None,
                       "last": dict(last) if last else None,
+                      "battery": bat[0] if bat else None, "battery_ts": bat[1] if bat else None,
                       "total": st.store.db.execute("SELECT COUNT(*) FROM reports WHERE device_id=?",
                                                    (did,)).fetchone()[0]})
     order = {"main": 0, "left": 1, "right": 2, "case": 3}
@@ -1545,9 +1657,135 @@ def apple_device_public(st: "State", d: dict) -> dict:
     out = {k: d.get(k) for k in ("id", "kind", "mode", "emoji", "model", "display_name", "device_class",
                                  "battery_level", "battery_status", "device_status", "hidden", "sort",
                                  "updated_at")}
+    sess = st.store.recordings(d["id"])
+    active = next((x for x in sess if x["active"]), None)
+    online_count = st.store.db.execute("SELECT COUNT(*) FROM online_reports WHERE apple_id=?",
+                                       (d["id"],)).fetchone()[0]
     out.update(name=d.get("custom_name") or d.get("name"), apple_name=d.get("name"), online=on,
-               parts=parts, best=best, reachable=d.get("device_status") in ("200", "201"))
+               parts=parts, best=best, reachable=d.get("device_status") in ("200", "201"),
+               settings=d.get("settings") or DEFAULT_APPLE_SETTINGS,
+               case_status=airpods_case_status(parts, (d.get("settings") or DEFAULT_APPLE_SETTINGS)["case"])
+               if d.get("mode") == "airpods" else None,
+               active_session=active, sessions_count=len(sess), online_points=online_count)
     return out
+
+
+def airpods_case_status(parts: list[dict], cfg: dict) -> dict | None:
+    """
+    Schätzt aus den Offline-Ortungen, ob die Ohrhörer im Case sind.
+    Grundlage: Ohrhörer senden eigene Wo-ist-Signale vor allem, wenn sie außerhalb des Case
+    sind. Ein frischer Bericht eines Ohrhörers ⇒ „draußen“. Hat das Case danach neuere
+    Berichte, während der Ohrhörer schweigt ⇒ „vermutlich im Case“. Sonst „unbekannt“.
+    """
+    by = {p["role"]: p for p in parts}
+    case_last = (by.get("case") or {}).get("last")
+    if not any(by.get(r) for r in ("left", "right")):
+        return None
+    win = float(cfg.get("window_min", 20)) * 60
+    t = now()
+    out: dict = {}
+    for r in ("left", "right"):
+        p = by.get(r)
+        last = (p or {}).get("last")
+        if not p:
+            out[r] = {"state": "no_key", "since": None, "reason": "Keine Schlüsseldatei"}
+            continue
+        if last and t - last["ts"] <= win:
+            reason = f"vor {int((t - last['ts']) / 60)} min eigenständig geortet"
+            if case_last and abs(case_last["ts"] - last["ts"]) < 900:
+                d = haversine(case_last["lat"], case_last["lon"], last["lat"], last["lon"])
+                if d > 40 + (case_last.get("accuracy") or 0) + (last.get("accuracy") or 0):
+                    reason += f", {fmt_dist(d)} vom Case entfernt"
+            out[r] = {"state": "out", "since": last["ts"], "reason": reason}
+        elif case_last and (not last or case_last["ts"] > last["ts"]):
+            out[r] = {"state": "in_case", "since": last["ts"] if last else None,
+                      "reason": "Case meldet sich, Ohrhörer nicht"}
+        else:
+            out[r] = {"state": "unknown", "since": last["ts"] if last else None,
+                      "reason": "Zu wenige aktuelle Ortungen"}
+    states = {out[r]["state"] for r in ("left", "right") if out[r]["state"] != "no_key"}
+    if states == {"in_case"}:
+        summary = "Im Case"
+    elif states == {"out"}:
+        summary = "Draußen"
+    elif "out" in states:
+        summary = "Teilweise draußen"
+    else:
+        summary = "Unbekannt"
+    out["summary"] = summary
+    out["estimated"] = True
+    return out
+
+
+async def check_case_alerts(st: "State") -> None:
+    """Erkennt Wechsel Case ↔ draußen und benachrichtigt (immer oder einmalig)."""
+    for d in st.store.apple_rows():
+        if d.get("mode") != "airpods" or not d.get("links"):
+            continue
+        pub = apple_device_public(st, d)
+        cs = pub.get("case_status")
+        if not cs:
+            continue
+        cfg = d["settings"]["case"]
+        state = d.get("state") or {}
+        prev: dict = state.get("case", {})
+        fired: dict = state.get("fired", {})
+        changed = False
+        for r in ("left", "right"):
+            cur = cs[r]["state"]
+            if cur in ("unknown", "no_key"):
+                continue
+            old = prev.get(r)
+            if old != cur:
+                prev[r] = cur
+                changed = True
+                if old is None:
+                    continue  # erste Einschätzung → kein Alarm
+                direction = "out" if cur == "out" else "in"
+                a = cfg["alert_out" if direction == "out" else "alert_in"]
+                if a.get("enabled") and not (cfg.get("once") and fired.get(f"{r}_{direction}")):
+                    fired[f"{r}_{direction}"] = True
+                    side = "Linker" if r == "left" else "Rechter"
+                    last = next((p["last"] for p in pub["parts"] if p["role"] == r), None) or {}
+                    await st.notifier.notify(
+                        device={"id": d["id"], "name": pub["name"], "emoji": d.get("emoji") or "🎧"},
+                        kind="airpods_case", level=a.get("level", "active"),
+                        title=(f"🎧 {side} AirPod wurde aus dem Case genommen" if direction == "out"
+                               else f"🎧 {side} AirPod ist wieder im Case"),
+                        body=f"{pub['name']} · {cs[r]['reason']}",
+                        lat=last.get("lat"), lon=last.get("lon"),
+                        url=f"findmyultra://apple/{quote(d['id'], safe='')}")
+        if changed:
+            st.store.apple_update(d["id"], state={**state, "case": prev, "fired": fired})
+
+
+def session_points(st: "State", se: dict) -> list[dict]:
+    """Alle Punkte einer Aufzeichnung (online + offline je nach Quelle), im Report-Format."""
+    row = st.store.apple_row(se["apple_id"])
+    if not row:
+        return []
+    lo, hi = se["start_ts"], se["effective_end"] or now() + 60
+    pts: list[dict] = []
+    if se["source"] in ("offline", "both"):
+        for role, did in (row.get("links") or {}).items():
+            for r in st.store.db.execute("SELECT * FROM reports WHERE device_id=? AND ts BETWEEN ? AND ?",
+                                         (did, lo, hi)).fetchall():
+                x = dict(r)
+                x.update(device_id=se["apple_id"], source="offline", role=role, position_type=None)
+                pts.append(x)
+    if se["source"] in ("online", "both"):
+        for r in st.store.db.execute("SELECT * FROM online_reports WHERE apple_id=? AND ts BETWEEN ? AND ?",
+                                     (se["apple_id"], lo, hi)).fetchall():
+            bl = r["battery_level"]
+            pts.append({"id": -int(r["id"]), "device_id": se["apple_id"], "ts": r["ts"], "lat": r["lat"],
+                        "lon": r["lon"], "accuracy": r["accuracy"], "confidence": None, "status": None,
+                        "battery": None if bl is None else ("full" if bl > .6 else "medium" if bl > .3 else
+                                                            "low" if bl > .1 else "critical"),
+                        "battery_level": bl, "received_at": r["received_at"], "batch_id": None,
+                        "batch_size": 1, "late": 0, "source": "online", "role": None,
+                        "position_type": r["position_type"]})
+    pts.sort(key=lambda p: p["ts"])
+    return pts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1753,7 +1991,7 @@ class Notifier:
             return False
 
     async def notify(self, *, device: dict | None, kind: str, level: str, title: str, body: str,
-                     lat: float | None = None, lon: float | None = None) -> None:
+                     lat: float | None = None, lon: float | None = None, url: str | None = None) -> None:
         level = level if level in LEVELS else "active"
         if lat is not None and lon is not None:
             addr = await self.address(lat, lon)
@@ -1766,6 +2004,8 @@ class Notifier:
                    "level": level, "title": title, "body": body, "lat": lat, "lon": lon}
         self.st.hub.publish("notification", payload)
         log.info("🔔 [%s] %s – %s", level, title, body.replace("\n", " | "))
+        if url and device is not None:
+            device = {**device, "url": url}
         ok, err = await self.send_bark(title, body, level, device, lat, lon)
         self.st.store.set_delivery(nid, ok, err)
 
@@ -1787,7 +2027,7 @@ class Notifier:
             data: dict = {"device_key": key, "title": title, "body": body, "level": level,
                           "group": bark.get("group") or APP_NAME}
             if device:
-                data["url"] = f"findmyultra://device/{quote(device['id'])}"
+                data["url"] = device.get("url") or f"findmyultra://device/{quote(device['id'])}"
                 data["subtitle"] = f"{device.get('emoji') or ''} {device.get('name') or ''}".strip()
             elif lat is not None:
                 data["url"] = f"https://maps.apple.com/?ll={lat},{lon}"
@@ -2034,6 +2274,9 @@ async def run_poll(st: State, plan: list[tuple[Tracked, str]]) -> int:
                 await st.alerts.on_reports(t.id, new, prev)
         st.registry.save_changed()
         st.apple.save()
+        if total_new:
+            with contextlib.suppress(Exception):
+                await check_case_alerts(st)
     except Exception as e:  # noqa: BLE001
         err = f"{type(e).__name__}: {e}"
         log.warning("Abruf fehlgeschlagen: %s", err)
@@ -2089,6 +2332,13 @@ async def scheduler(st: State) -> None:
             last_offline = t0
             with contextlib.suppress(Exception):
                 await st.alerts.check_offline()
+            with contextlib.suppress(Exception):
+                await check_case_alerts(st)
+            with contextlib.suppress(Exception):
+                for se in st.store.recordings():
+                    if se["stopped_ts"] is None and se["end_ts"] and se["end_ts"] <= now():
+                        st.store.update_recording(se["id"], stopped_ts=se["end_ts"])
+                        st.hub.publish("apple_devices", {"changed": True})
         if t0 - last_purge > 3600:
             last_purge = t0
             n = st.store.purge(s)
@@ -2637,6 +2887,10 @@ def build_app(st: State) -> web.Application:
             upd["hidden"] = bool(b["hidden"])
         if "sort" in b:
             upd["sort"] = int(b["sort"])
+        if isinstance(b.get("settings"), dict):
+            upd["settings"] = json.dumps(deep_merge(row["settings"], b["settings"]))
+        if b.get("rearm"):
+            upd["state"] = json.dumps({**(row.get("state") or {}), "fired": {}})
         st.store.apple_update(aid, **upd)
         st.hub.publish("apple_devices", {"changed": True})
         return web.json_response(apple_device_public(st, st.store.apple_row(aid)))
@@ -2742,6 +2996,87 @@ def build_app(st: State) -> web.Application:
         except Exception as e:  # noqa: BLE001
             return jerr(502, f"Ton fehlgeschlagen: {e}")
         return web.json_response({"ok": True})
+
+    # --- Aufzeichnungen (Sessions) ------------------------------------------------------
+    def _session_public(se: dict) -> dict:
+        pts = session_points(st, se)
+        on = sum(1 for p in pts if p["source"] == "online")
+        return {**se, "points": len(pts), "online_points": on, "offline_points": len(pts) - on,
+                "last_ts": pts[-1]["ts"] if pts else None}
+
+    async def sessions_list(req: web.Request) -> web.Response:
+        aid = req.match_info["id"]
+        return web.json_response({"sessions": [_session_public(x) for x in st.store.recordings(aid)]})
+
+    async def session_start(req: web.Request) -> web.Response:
+        aid = req.match_info["id"]
+        row = st.store.apple_row(aid)
+        if not row:
+            return jerr(404, "Unbekanntes Gerät")
+        b = await req.json() if req.can_read_body else {}
+        source = b.get("source") if b.get("source") in ("both", "offline", "online") else "both"
+        if any(x["active"] for x in st.store.recordings(aid)):
+            return jerr(409, "Für dieses Gerät läuft bereits eine Aufzeichnung.")
+        end_ts = None
+        if b.get("end_ts"):
+            end_ts = float(b["end_ts"])
+        elif b.get("duration_hours"):
+            end_ts = now() + float(b["duration_hours"]) * 3600
+        name = (b.get("name") or "").strip()[:80] or \
+            f"Aufzeichnung {dt.datetime.now().strftime('%d.%m. %H:%M')}"
+        sid = st.store.add_recording(aid, name, source, end_ts)
+        linked = list((row.get("links") or {}).values())
+        if linked and source != "online":
+            st.wake(linked, full=True)
+        if st.online:
+            st.online.event.set()
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(_session_public(st.store.recording(sid)))
+
+    async def session_patch(req: web.Request) -> web.Response:
+        sid = int(req.match_info["sid"])
+        se = st.store.recording(sid)
+        if not se:
+            return jerr(404, "Unbekannte Aufzeichnung")
+        b = await req.json()
+        f: dict = {}
+        if "name" in b:
+            f["name"] = (b["name"] or se["name"])[:80]
+        if b.get("source") in ("both", "offline", "online"):
+            f["source"] = b["source"]
+        if "end_ts" in b:
+            f["end_ts"] = float(b["end_ts"]) if b["end_ts"] else None
+        if b.get("extend_hours"):
+            base = max(se["end_ts"] or now(), now())
+            f["end_ts"] = base + float(b["extend_hours"]) * 3600
+        if b.get("resume"):
+            f["stopped_ts"] = None
+        st.store.update_recording(sid, **f)
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(_session_public(st.store.recording(sid)))
+
+    async def session_stop(req: web.Request) -> web.Response:
+        sid = int(req.match_info["sid"])
+        se = st.store.recording(sid)
+        if not se:
+            return jerr(404, "Unbekannte Aufzeichnung")
+        if se["stopped_ts"] is None:
+            st.store.update_recording(sid, stopped_ts=now())
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(_session_public(st.store.recording(sid)))
+
+    async def recording_delete(req: web.Request) -> web.Response:
+        st.store.delete_recording(int(req.match_info["sid"]))
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response({"ok": True})
+
+    async def session_points_route(req: web.Request) -> web.Response:
+        se = st.store.recording(int(req.match_info["sid"]))
+        if not se:
+            return jerr(404, "Unbekannte Aufzeichnung")
+        pts = session_points(st, se)
+        stays = compute_stays(pts, dict(st.store.settings().get("stays", {})))
+        return web.json_response({"session": _session_public(se), "points": pts, **stays})
 
     async def icloud_connect(req: web.Request) -> web.Response:
         b = await req.json() if req.can_read_body else {}
@@ -2933,6 +3268,12 @@ def build_app(st: State) -> web.Application:
     r.add_post("/api/apple-devices/{id:.+}/offline", apple_offline_import)
     r.add_delete("/api/apple-devices/{id:.+}/offline/{role:main|left|right|case}", apple_offline_remove)
     r.add_post("/api/apple-devices/{id:.+}/sound", apple_sound)
+    r.add_get("/api/apple-devices/{id:.+}/sessions", sessions_list)
+    r.add_post("/api/apple-devices/{id:.+}/sessions", session_start)
+    r.add_get("/api/sessions/{sid:\\d+}/points", session_points_route)
+    r.add_post("/api/sessions/{sid:\\d+}/stop", session_stop)
+    r.add_patch("/api/sessions/{sid:\\d+}", session_patch)
+    r.add_delete("/api/sessions/{sid:\\d+}", recording_delete)
     r.add_patch("/api/apple-devices/{id:.+}", apple_patch)
     r.add_delete("/api/apple-devices/{id:.+}", apple_delete_route)
     r.add_post("/api/icloud/connect", icloud_connect)

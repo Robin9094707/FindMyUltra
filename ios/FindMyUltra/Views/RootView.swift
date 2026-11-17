@@ -44,7 +44,9 @@ struct FindSheet: View {
             root
                 .toolbar(.hidden, for: .navigationBar)
                 .navigationDestination(for: DeviceRoute.self) { r in
-                    if r.apple { AppleDeviceDetailView(deviceID: r.id) } else { DeviceDetailView(deviceID: r.id) }
+                    if r.recording, let sid = Int(r.id) { RecordingDetailView(recordingID: sid) }
+                    else if r.apple { AppleDeviceDetailView(deviceID: r.id) }
+                    else { DeviceDetailView(deviceID: r.id) }
                 }
         }
         .overlay(alignment: .top) {

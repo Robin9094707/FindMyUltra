@@ -345,8 +345,11 @@ struct AppleDeviceDetailView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         header(d)
                         actions(d)
+                        if d.isAirPods { CaseStatusCard(device: d) }
                         locationsCard(d)
+                        RecordingsCard(device: d)
                         offlineCard(d)
+                        DataSourcesCard(device: d)
                         infoCard(d)
                     }
                     .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 40)
@@ -402,6 +405,13 @@ struct AppleDeviceDetailView: View {
                             Text("·").foregroundStyle(.secondary)
                             Text(t).foregroundStyle(d.batteryColor)
                             Image(systemName: d.batteryIcon).foregroundStyle(d.batteryColor)
+                        } else if let pb = d.parts.compactMap(\.battery).first {
+                            Text("·").foregroundStyle(.secondary)
+                            BatteryView(level: pb)
+                            Text(BatteryLevel.label(pb)).foregroundStyle(BatteryLevel.color(pb))
+                        }
+                        if d.activeSession != nil {
+                            Image(systemName: "record.circle.fill").foregroundStyle(.red)
                         }
                     }
                     .font(.subheadline)
@@ -459,7 +469,7 @@ struct AppleDeviceDetailView: View {
                 locRow(icon: r == .main ? "antenna.radiowaves.left.and.right" : r.symbol, color: .gray,
                        title: r == .main ? "Offline (Wo-ist-Netzwerk)" : r.label,
                        date: p?.last?.date,
-                       detail: p?.last.map { "±\($0.accuracy ?? 0) m · \(p?.total ?? 0) Standorte" },
+                       detail: p?.last.map { "±\($0.accuracy ?? 0) m · \(p?.total ?? 0) Standorte\(p?.battery.map { " · Akku " + BatteryLevel.label($0) } ?? "")" },
                        empty: p == nil ? "Keine Schlüsseldatei" : "Noch kein Standort",
                        coord: p?.last?.coordinate)
             }

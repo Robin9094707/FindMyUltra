@@ -114,7 +114,7 @@ struct MapScreen: View {
             }
 
             // Verlauf nur, wenn eingeblendet
-            if let d = focused, model.historyVisible {
+            if let tint = model.trackTint, model.historyVisible {
                 // Aufenthalte (gelb)
                 if model.showStays {
                     ForEach(model.stays) { st in
@@ -139,12 +139,12 @@ struct MapScreen: View {
                 // Spur
                 if model.track.count > 1 {
                     MapPolyline(coordinates: model.track.map(\.coordinate))
-                        .stroke(d.tint.opacity(0.7), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                        .stroke(tint.opacity(0.7), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
                 }
                 // Punkte (antippbar)
                 ForEach(dots, id: \.report.id) { item in
                     Annotation("", coordinate: item.report.coordinate, anchor: .center) {
-                        HistoryDot(color: d.tint,
+                        HistoryDot(color: item.report.isOnline ? Color.green : tint,
                                    progress: Double(item.index) / Double(max(model.track.count - 1, 1)),
                                    selected: item.index == model.cursor)
                     }
