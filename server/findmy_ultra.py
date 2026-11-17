@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -2929,11 +2929,12 @@ def build_app(st: State) -> web.Application:
     r.add_get("/api/apple-devices", apple_devices)
     r.add_post("/api/apple-devices", apple_create_route)
     r.add_post("/api/apple-devices/refresh", apple_refresh)
-    r.add_patch("/api/apple-devices/{id}", apple_patch)
-    r.add_delete("/api/apple-devices/{id}", apple_delete_route)
-    r.add_post("/api/apple-devices/{id}/offline", apple_offline_import)
-    r.add_delete("/api/apple-devices/{id}/offline/{role}", apple_offline_remove)
-    r.add_post("/api/apple-devices/{id}/sound", apple_sound)
+    # Apple-IDs enthalten „/“, „+“, „=“ → {id:.+}; spezifische Routen zuerst registrieren
+    r.add_post("/api/apple-devices/{id:.+}/offline", apple_offline_import)
+    r.add_delete("/api/apple-devices/{id:.+}/offline/{role:main|left|right|case}", apple_offline_remove)
+    r.add_post("/api/apple-devices/{id:.+}/sound", apple_sound)
+    r.add_patch("/api/apple-devices/{id:.+}", apple_patch)
+    r.add_delete("/api/apple-devices/{id:.+}", apple_delete_route)
     r.add_post("/api/icloud/connect", icloud_connect)
     r.add_post("/api/icloud/2fa/sms", icloud_sms)
     r.add_post("/api/icloud/2fa/submit", icloud_code)

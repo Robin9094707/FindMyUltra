@@ -377,7 +377,7 @@ struct AppleDeviceDetailView: View {
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button(device?.isCloud == true ? "Ausblenden" : "Entfernen", role: .destructive) {
                 Task {
-                    _ = try? await model.api?.send("DELETE", "/api/apple-devices/\(deviceID)", as: OKResult.self)
+                    _ = try? await model.api?.send("DELETE", "/api/apple-devices/\(APIClient.seg(deviceID))", as: OKResult.self)
                     await model.reloadAppleDevices()
                     Haptics.success()
                     model.sheetPath = []
@@ -568,7 +568,7 @@ struct AppleDeviceDetailView: View {
 
     private func patch(_ body: [String: Any]) async {
         do {
-            let _: AppleDevice = try await model.api!.send("PATCH", "/api/apple-devices/\(deviceID)", json: body)
+            let _: AppleDevice = try await model.api!.send("PATCH", "/api/apple-devices/\(APIClient.seg(deviceID))", json: body)
             await model.reloadAppleDevices()
             Haptics.success()
         } catch {
@@ -586,7 +586,7 @@ struct AppleDeviceDetailView: View {
             return
         }
         do {
-            let _: AppleDevice = try await api.uploadOne("/api/apple-devices/\(deviceID)/offline",
+            let _: AppleDevice = try await api.uploadOne("/api/apple-devices/\(APIClient.seg(deviceID))/offline",
                                                          query: [.init(name: "role", value: role.rawValue)],
                                                          name: url.lastPathComponent, data: data)
             await model.reloadAppleDevices()
@@ -601,7 +601,7 @@ struct AppleDeviceDetailView: View {
 
     private func removeRole(_ r: PartRole) async {
         do {
-            let _: AppleDevice = try await model.api!.send("DELETE", "/api/apple-devices/\(deviceID)/offline/\(r.rawValue)")
+            let _: AppleDevice = try await model.api!.send("DELETE", "/api/apple-devices/\(APIClient.seg(deviceID))/offline/\(r.rawValue)")
             await model.reloadAppleDevices()
             Haptics.success()
         } catch {
@@ -614,7 +614,7 @@ struct AppleDeviceDetailView: View {
         busy = true
         defer { busy = false }
         do {
-            let _: OKResult = try await model.api!.send("POST", "/api/apple-devices/\(d.id)/sound")
+            let _: OKResult = try await model.api!.send("POST", "/api/apple-devices/\(APIClient.seg(d.id))/sound")
             Haptics.success()
             model.showToast("🔊 Ton wird auf \(d.name) abgespielt")
         } catch {

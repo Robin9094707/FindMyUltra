@@ -65,9 +65,17 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         return u
     }
 
+    /// Kodiert ein Pfadsegment vollständig (Apple-IDs enthalten „/“, „+“, „=“).
+    static func seg(_ s: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+    }
+
     func url(_ path: String, query: [URLQueryItem] = []) throws -> URL {
         guard var c = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw APIError.invalidURL }
-        c.path = (c.path.hasSuffix("/") ? String(c.path.dropLast()) : c.path) + path
+        let base = c.percentEncodedPath
+        c.percentEncodedPath = (base.hasSuffix("/") ? String(base.dropLast()) : base) + path
         if !query.isEmpty { c.queryItems = query }
         guard let u = c.url else { throw APIError.invalidURL }
         return u
