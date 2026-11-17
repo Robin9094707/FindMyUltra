@@ -33,6 +33,11 @@ struct SettingsView: View {
                 } label: {
                     Label("Schlüssel importieren (.json / .plist)", systemImage: "square.and.arrow.down.on.square")
                 }
+                Button {
+                    Task { await importFromClipboard() }
+                } label: {
+                    Label("JSON aus Zwischenablage einfügen", systemImage: "doc.on.clipboard")
+                }
                 if let importResult { Text(importResult).font(.footnote) }
             } header: {
                 Text("Apple & Objekte")
@@ -73,9 +78,14 @@ struct SettingsView: View {
         }
         .onAppear { if draft == nil { draft = model.settings } }
         .onChange(of: model.settings) { old, new in if draft == nil || draft == old { draft = new } }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.json, .propertyList, .xmlPropertyList, .data],
-                      allowsMultipleSelection: true) { result in
-            Task { await handleImport(result) }
+        .sheet(isPresented: $importing) {
+            DocumentPicker { urls in
+                importing = false
+                Task { await handleImport(.success(urls)) }
+            } onCancel: {
+                importing = false
+            }
+            .ignoresSafeArea()
         }
         .confirmationDialog("Vom Server abmelden?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
             Button("Abmelden", role: .destructive) { Task { await model.logout() } }
@@ -249,24 +259,42 @@ struct SettingsView: View {
         }
     }
 
-    private func handleImport(_ result: Result<[URL], Error>) async {
-        guard case .success(let urls) = result, let api = model.api else { return }
-        var files: [(name: String, data: Data)] = []
-        for u in urls {
-            let ok = u.startAccessingSecurityScopedResource()
-            defer { if ok { u.stopAccessingSecurityScopedResource() } }
-            if let d = try? Data(contentsOf: u) { files.append((u.lastPathComponent, d)) }
+    private func importFromClipboard() async {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            importResult = "❌ Zwischenablage ist leer – öffne die JSON-Datei, „Alles auswählen“ → „Kopieren“."
+            return
         }
-        guard !files.isEmpty else { return }
+        await upload([("zwischenablage.json", Data(text.utf8))])
+    }
+
+    private func upload(_ files: [(name: String, data: Data)]) async {
+        guard let api = model.api else { return }
+        importResult = "Importiere \(files.count) Datei(en) …"
         do {
             let r = try await api.upload(files: files)
             let added = (r.added ?? []).map { "✅ \($0.name)\($0.new ? "" : " (aktualisiert)")" }
             let failed = (r.errors ?? []).map { "❌ \($0.file): \($0.error)" }
             importResult = (added + failed).joined(separator: "\n")
             await model.reloadDevices()
+            if !added.isEmpty { model.showToast("✅ \(added.count) Objekt(e) importiert") }
         } catch {
             importResult = "❌ \(error.localizedDescription)"
         }
+    }
+
+    private func handleImport(_ result: Result<[URL], Error>) async {
+        guard case .success(let urls) = result else { return }
+        var files: [(name: String, data: Data)] = []
+        for u in urls {
+            let ok = u.startAccessingSecurityScopedResource()
+            defer { if ok { u.stopAccessingSecurityScopedResource() } }
+            if let d = try? Data(contentsOf: u) { files.append((u.lastPathComponent, d)) }
+        }
+        guard !files.isEmpty else {
+            importResult = "❌ Datei konnte nicht gelesen werden"
+            return
+        }
+        await upload(files)
     }
 }
 
