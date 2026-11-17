@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -242,6 +242,10 @@ DEFAULT_APPLE_SETTINGS: dict = {
         "alert_out": {"enabled": False, "level": "timeSensitive"},
         "alert_in": {"enabled": False, "level": "active"},
         "once": False,             # True: jede Richtung nur einmal, bis neu scharf geschaltet
+        "sep_distance_m": 150,     # Teile gelten als getrennt ab dieser Entfernung (+ Ungenauigkeit)
+        "sep_min_obs": 2,          # … bestätigt nach so vielen getrennten Ortungen in Folge
+        "sep_lookback_h": 6,
+        "alert_separated": {"enabled": False, "level": "timeSensitive"},
     },
 }
 
@@ -386,6 +390,10 @@ class Store:
             self.db.execute("ALTER TABLE apple_devices ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")
         if "state" not in acols:
             self.db.execute("ALTER TABLE apple_devices ADD COLUMN state TEXT NOT NULL DEFAULT '{}'")
+        if "extra" not in acols:
+            self.db.execute("ALTER TABLE apple_devices ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
+        if "raw" not in acols:
+            self.db.execute("ALTER TABLE apple_devices ADD COLUMN raw TEXT NOT NULL DEFAULT '{}'")
         self.db.commit()
 
     # kv / settings ----------------------------------------------------------
@@ -494,6 +502,8 @@ class Store:
             d["links"] = json.loads(d.get("links") or "{}")
             d["settings"] = deep_merge(DEFAULT_APPLE_SETTINGS, json.loads(d.get("settings") or "{}"))
             d["state"] = json.loads(d.get("state") or "{}")
+            d["extra"] = json.loads(d.get("extra") or "{}")
+            d.pop("raw", None)
             d["hidden"] = bool(d["hidden"])
             out.append(d)
         return out
@@ -581,7 +591,7 @@ class Store:
             return
         cols, vals = [], []
         for k, v in fields.items():
-            if k in ("links", "online", "settings", "state") and not isinstance(v, str):
+            if k in ("links", "online", "settings", "state", "extra", "raw") and not isinstance(v, str):
                 v = json.dumps(v) if v is not None else None
             if k == "hidden":
                 v = int(bool(v))
@@ -1549,17 +1559,68 @@ class OnlineDevices:
                       "position_type": loc.get("positionType"), "is_old": bool(loc.get("isOld")),
                       "inaccurate": bool(loc.get("isInaccurate"))}
         bl = d.get("batteryLevel")
-        return {"id": str(d.get("id")), "name": d.get("name") or d.get("deviceDisplayName") or "Gerät",
+        feats = d.get("features") or {}
+        lost = d.get("lostDevice") or {}
+        extra = {
+            "low_power_mode": d.get("lowPowerMode"),
+            "battery_status": d.get("batteryStatus"),
+            "altitude": (loc or {}).get("altitude"),
+            "vertical_accuracy": (loc or {}).get("verticalAccuracy"),
+            "floor_level": (loc or {}).get("floorLevel"),
+            "position_type": (loc or {}).get("positionType"),
+            "location_enabled": d.get("locationEnabled"),
+            "is_locating": d.get("isLocating"),
+            "lost_mode_capable": d.get("lostModeCapable"),
+            "lost_mode_enabled": d.get("lostModeEnabled"),
+            "lost_message": lost.get("text") if isinstance(lost, dict) else None,
+            "lost_number": lost.get("ownerNbr") if isinstance(lost, dict) else None,
+            "activation_locked": d.get("activationLocked"),
+            "can_sound": bool(feats.get("SND")), "can_message": bool(feats.get("MSG")),
+            "can_locate": bool(feats.get("LOC")), "can_lost": bool(d.get("lostModeCapable")),
+            "device_color": d.get("deviceColor"),
+            "model_display_name": d.get("modelDisplayName"),
+            "prs_id": d.get("prsId"),
+            "audio_channels": [
+                {"name": c.get("name"), "available": c.get("available"), "playing": c.get("playing"),
+                 "muted": c.get("muted")} for c in (d.get("audioChannels") or []) if isinstance(c, dict)],
+        }
+        return {"extra": extra, "raw": OnlineDevices._sanitize(d),
+                "id": str(d.get("id")), "name": d.get("name") or d.get("deviceDisplayName") or "Gerät",
                 "model": d.get("rawDeviceModel") or d.get("deviceModel"),
                 "display_name": d.get("deviceDisplayName"), "device_class": d.get("deviceClass"),
                 "battery_level": float(bl) if isinstance(bl, (int, float)) and bl > 0 else None,
                 "battery_status": d.get("batteryStatus"), "device_status": str(d.get("deviceStatus") or ""),
                 "online": online}
 
+    SENSITIVE = ("id", "baUUID", "deviceDiscoveryId", "prsId", "token", "Token", "passcode", "mesg",
+                 "snd", "msg", "lostDevice", "wipedTimestamp", "encodedDeviceId", "commandLookupId")
+
+    @staticmethod
+    def _sanitize(v: Any, key: str = "") -> Any:
+        """Rohdaten ohne IDs/Tokens (zur Anzeige in der App)."""
+        if isinstance(v, dict):
+            return {k: ("•••" if any(s in k for s in OnlineDevices.SENSITIVE) and not isinstance(x, (bool, int, float))
+                        else OnlineDevices._sanitize(x, k)) for k, x in v.items()}
+        if isinstance(v, list):
+            return [OnlineDevices._sanitize(x, key) for x in v]
+        return v
+
     def _fetch(self) -> list[dict]:
         mgr = self.api.devices
         mgr.refresh(locate=True)
-        return [self._parse(dict(dev.data)) for dev in mgr]
+        members = {}
+        with contextlib.suppress(Exception):
+            ui = mgr.user_info or {}
+            for pid, m in (ui.get("membersInfo") or {}).items():
+                members[str(pid)] = " ".join(x for x in (m.get("firstName"), m.get("lastName")) if x)
+        out = []
+        for dev in mgr:
+            item = self._parse(dict(dev.data))
+            pid = item["extra"].pop("prs_id", None)
+            item["extra"]["owner"] = members.get(str(pid)) if pid else None
+            item["extra"]["family"] = bool(pid and members and str(pid) in members)
+            out.append(item)
+        return out
 
     async def refresh(self, force: bool = False) -> int:
         if self.st.args.demo or self.state != "connected" or self.api is None:
@@ -1572,6 +1633,7 @@ class OnlineDevices:
                 items = await asyncio.wait_for(asyncio.to_thread(self._fetch), timeout=90)
                 for it in items:
                     self.st.store.apple_upsert_fmip(it)
+                    self.st.store.apple_update(it["id"], extra=it.get("extra") or {}, raw=it.get("raw") or {})
                     if it.get("online") and it["online"].get("ts"):
                         self.st.store.add_online_report(it["id"], it["online"], it.get("battery_level"))
                 self.error, self.failures, self.last_refresh = None, 0, now()
@@ -1586,6 +1648,21 @@ class OnlineDevices:
                     self.state = "disconnected"  # nicht automatisch mit Passwort neu anmelden
                 self._publish()
                 return 0
+
+    def _dev(self, aid: str) -> Any:
+        if self.state != "connected" or self.api is None:
+            raise RuntimeError("Online-Ortung ist nicht verbunden")
+        dev = next((d for d in self.api.devices if str(d.data.get("id")) == aid), None)
+        if dev is None:
+            raise RuntimeError("Gerät nicht gefunden")
+        return dev
+
+    async def send_message(self, aid: str, subject: str, text: str, sound: bool) -> None:
+        await asyncio.to_thread(lambda: self._dev(aid).display_message(subject=subject or "FindMy Ultra",
+                                                                       message=text, sounds=sound))
+
+    async def lost_mode(self, aid: str, number: str, text: str) -> None:
+        await asyncio.to_thread(lambda: self._dev(aid).lost_device(number=number, text=text))
 
     async def play_sound(self, aid: str) -> None:
         if self.state != "connected" or self.api is None:
@@ -1637,9 +1714,13 @@ def apple_device_public(st: "State", d: dict) -> dict:
         dev = st.store.device_row(did)
         bat = st.store.db.execute("SELECT battery, ts FROM reports WHERE device_id=? AND battery IS NOT NULL "
                                   "ORDER BY ts DESC LIMIT 1", (did,)).fetchone()
+        stt = st.store.db.execute("SELECT status FROM reports WHERE device_id=? AND status IS NOT NULL "
+                                  "ORDER BY ts DESC LIMIT 1", (did,)).fetchone()
+        status_type = STATUS_TYPES.get(((stt[0] or 0) >> 4) & 0b11) if stt else None
         parts.append({"role": role, "device_id": did, "name": dev["name"] if dev else None,
                       "last": dict(last) if last else None,
                       "battery": bat[0] if bat else None, "battery_ts": bat[1] if bat else None,
+                      "status_type": status_type,
                       "total": st.store.db.execute("SELECT COUNT(*) FROM reports WHERE device_id=?",
                                                    (did,)).fetchone()[0]})
     order = {"main": 0, "left": 1, "right": 2, "case": 3}
@@ -1664,13 +1745,69 @@ def apple_device_public(st: "State", d: dict) -> dict:
     out.update(name=d.get("custom_name") or d.get("name"), apple_name=d.get("name"), online=on,
                parts=parts, best=best, reachable=d.get("device_status") in ("200", "201"),
                settings=d.get("settings") or DEFAULT_APPLE_SETTINGS,
-               case_status=airpods_case_status(parts, (d.get("settings") or DEFAULT_APPLE_SETTINGS)["case"])
+               case_status=airpods_case_status(parts, (d.get("settings") or DEFAULT_APPLE_SETTINGS)["case"],
+                                               (d.get("extra") or {}).get("audio_channels"),
+                                               (on or {}).get("ts"))
                if d.get("mode") == "airpods" else None,
-               active_session=active, sessions_count=len(sess), online_points=online_count)
+               active_session=active, sessions_count=len(sess), online_points=online_count,
+               extra=d.get("extra") or {},
+               separation=airpods_separation(st, d, (d.get("settings") or DEFAULT_APPLE_SETTINGS)["case"])
+               if d.get("mode") == "airpods" else None)
     return out
 
 
-def airpods_case_status(parts: list[dict], cfg: dict) -> dict | None:
+STATUS_TYPES = {0b00: "apple", 0b01: "airtag", 0b10: "third_party", 0b11: "airpods"}
+
+
+def airpods_separation(st: "State", d: dict, cfg: dict) -> list[dict] | None:
+    """
+    Erkennt, ob AirPods-Teile getrennt sind: Zwei Teile gelten als getrennt, wenn sie zu
+    ähnlicher Zeit (≤ 15 min Abstand) an verschiedenen Orten geortet wurden – erst bestätigt nach
+    mind. `sep_min_obs` solchen Beobachtungen in Folge (einzelne Ausreißer zählen nicht).
+    """
+    links = d.get("links") or {}
+    roles = [r for r in ("left", "right", "case") if r in links]
+    if len(roles) < 2:
+        return None
+    lookback = now() - float(cfg.get("sep_lookback_h", 6)) * 3600
+    min_obs = int(cfg.get("sep_min_obs", 2))
+    base_m = float(cfg.get("sep_distance_m", 150))
+    reps = {r: [dict(x) for x in st.store.db.execute(
+        "SELECT ts, lat, lon, accuracy FROM reports WHERE device_id=? AND ts>=? ORDER BY ts", (links[r], lookback))]
+        for r in roles}
+    out = []
+    for i, a in enumerate(roles):
+        for b in roles[i + 1:]:
+            obs = []
+            for x in reps[a]:
+                near = min(reps[b], key=lambda y: abs(y["ts"] - x["ts"]), default=None)
+                if near is None or abs(near["ts"] - x["ts"]) > 900:
+                    continue
+                dist = haversine(x["lat"], x["lon"], near["lat"], near["lon"])
+                thr = base_m + (x["accuracy"] or 0) + (near["accuracy"] or 0)
+                obs.append((max(x["ts"], near["ts"]), dist, dist > thr))
+            obs.sort()
+            streak = 0
+            for _, _, sep in reversed(obs):
+                if not sep:
+                    break
+                streak += 1
+            if not obs:
+                state = "unknown"
+            elif streak >= min_obs:
+                state = "separated"
+            elif obs[-1][2]:
+                state = "maybe"
+            else:
+                state = "together"
+            out.append({"a": a, "b": b, "state": state, "distance": round(obs[-1][1]) if obs else None,
+                        "observations": len(obs), "streak": streak, "since": obs[-streak][0] if streak else None,
+                        "last_ts": obs[-1][0] if obs else None})
+    return out
+
+
+def airpods_case_status(parts: list[dict], cfg: dict, channels: list | None = None,
+                        online_ts: float | None = None) -> dict | None:
     """
     Schätzt aus den Offline-Ortungen, ob die Ohrhörer im Case sind.
     Grundlage: Ohrhörer senden eigene Wo-ist-Signale vor allem, wenn sie außerhalb des Case
@@ -1692,6 +1829,8 @@ def airpods_case_status(parts: list[dict], cfg: dict) -> dict | None:
             continue
         if last and t - last["ts"] <= win:
             reason = f"vor {int((t - last['ts']) / 60)} min eigenständig geortet"
+            if p.get("status_type") and p["status_type"] != "airpods":
+                reason += " (Statusbyte: kein AirPods-Typ?)"
             if case_last and abs(case_last["ts"] - last["ts"]) < 900:
                 d = haversine(case_last["lat"], case_last["lon"], last["lat"], last["lon"])
                 if d > 40 + (case_last.get("accuracy") or 0) + (last.get("accuracy") or 0):
@@ -1703,6 +1842,13 @@ def airpods_case_status(parts: list[dict], cfg: dict) -> dict | None:
         else:
             out[r] = {"state": "unknown", "since": last["ts"] if last else None,
                       "reason": "Zu wenige aktuelle Ortungen"}
+    # Online-Hinweis: iCloud meldet einen Audiokanal als verfügbar ⇒ Ohrhörer aktiv/außerhalb des Case
+    if channels and online_ts and t - online_ts <= win:
+        for ch in channels:
+            side = (ch.get("name") or "").lower()
+            r = "left" if side.startswith("l") else "right" if side.startswith("r") else None
+            if r and ch.get("available") and out.get(r, {}).get("state") != "no_key":
+                out[r] = {"state": "out", "since": online_ts, "reason": "iCloud: Kanal aktiv (online)"}
     states = {out[r]["state"] for r in ("left", "right") if out[r]["state"] != "no_key"}
     if states == {"in_case"}:
         summary = "Im Case"
@@ -1755,8 +1901,31 @@ async def check_case_alerts(st: "State") -> None:
                         body=f"{pub['name']} · {cs[r]['reason']}",
                         lat=last.get("lat"), lon=last.get("lon"),
                         url=f"findmyultra://apple/{quote(d['id'], safe='')}")
+        # Trennung (z. B. linker AirPod woanders als rechter/Case)
+        seps: dict = state.get("sep", {})
+        for sp in pub.get("separation") or []:
+            key = f"{sp['a']}-{sp['b']}"
+            cur = sp["state"]
+            if cur not in ("separated", "together"):
+                continue
+            old = seps.get(key)
+            if old != cur:
+                seps[key] = cur
+                changed = True
+                a = cfg.get("alert_separated") or {}
+                if old == "together" and cur == "separated" and a.get("enabled") \
+                        and not (cfg.get("once") and fired.get(f"sep_{key}")):
+                    fired[f"sep_{key}"] = True
+                    names = {"left": "Linker AirPod", "right": "Rechter AirPod", "case": "Case"}
+                    await st.notifier.notify(
+                        device={"id": d["id"], "name": pub["name"], "emoji": d.get("emoji") or "🎧"},
+                        kind="airpods_separated", level=a.get("level", "timeSensitive"),
+                        title=f"🎧 {names[sp['a']]} und {names[sp['b']]} sind getrennt",
+                        body=f"{pub['name']} · {fmt_dist(sp['distance'] or 0)} auseinander "
+                             f"({sp['streak']} Ortungen bestätigt)",
+                        url=f"findmyultra://apple/{quote(d['id'], safe='')}")
         if changed:
-            st.store.apple_update(d["id"], state={**state, "case": prev, "fired": fired})
+            st.store.apple_update(d["id"], state={**state, "case": prev, "fired": fired, "sep": seps})
 
 
 def session_points(st: "State", se: dict) -> list[dict]:
@@ -2986,6 +3155,38 @@ def build_app(st: State) -> web.Application:
         return web.json_response({"ok": True, "online_devices": n, "new_offline": res.get("new", 0),
                                   "online_error": st.online.error if st.online else None, **apple_list()})
 
+    async def apple_raw(req: web.Request) -> web.Response:
+        r = st.store.db.execute("SELECT raw FROM apple_devices WHERE id=?", (req.match_info["id"],)).fetchone()
+        if not r:
+            return jerr(404, "Unbekanntes Gerät")
+        return web.json_response({"raw": json.loads(r[0] or "{}")})
+
+    async def apple_message(req: web.Request) -> web.Response:
+        need_real()
+        row = st.store.apple_row(req.match_info["id"])
+        if not row or row["kind"] != "fmip":
+            return jerr(400, "Nur bei online verbundenen Apple-Geräten möglich")
+        b = await req.json()
+        try:
+            await st.online.send_message(row["id"], b.get("subject", ""), b.get("text", ""), bool(b.get("sound")))
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Nachricht fehlgeschlagen: {e}")
+        return web.json_response({"ok": True})
+
+    async def apple_lost(req: web.Request) -> web.Response:
+        need_real()
+        row = st.store.apple_row(req.match_info["id"])
+        if not row or row["kind"] != "fmip":
+            return jerr(400, "Nur bei online verbundenen Apple-Geräten möglich")
+        b = await req.json()
+        try:
+            await st.online.lost_mode(row["id"], str(b.get("number", "")), b.get("text") or
+                                      "Dieses Gerät wurde verloren. Bitte ruf mich an.")
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Verloren-Modus fehlgeschlagen: {e}")
+        await st.online.refresh(force=True)
+        return web.json_response({"ok": True})
+
     async def apple_sound(req: web.Request) -> web.Response:
         need_real()
         row = st.store.apple_row(req.match_info["id"])
@@ -3268,6 +3469,9 @@ def build_app(st: State) -> web.Application:
     r.add_post("/api/apple-devices/{id:.+}/offline", apple_offline_import)
     r.add_delete("/api/apple-devices/{id:.+}/offline/{role:main|left|right|case}", apple_offline_remove)
     r.add_post("/api/apple-devices/{id:.+}/sound", apple_sound)
+    r.add_get("/api/apple-devices/{id:.+}/raw", apple_raw)
+    r.add_post("/api/apple-devices/{id:.+}/message", apple_message)
+    r.add_post("/api/apple-devices/{id:.+}/lost", apple_lost)
     r.add_get("/api/apple-devices/{id:.+}/sessions", sessions_list)
     r.add_post("/api/apple-devices/{id:.+}/sessions", session_start)
     r.add_get("/api/sessions/{sid:\\d+}/points", session_points_route)

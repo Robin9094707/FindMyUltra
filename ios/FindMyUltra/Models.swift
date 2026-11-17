@@ -190,6 +190,7 @@ struct AppleDevicePart: Codable, Hashable, Identifiable {
     var last: Report?
     var battery: String?
     var batteryTs: Double?
+    var statusType: String?
     var total: Int
     var id: String { role }
 }
@@ -229,6 +230,93 @@ struct CaseConfig: Codable, Hashable {
     var alertOut: CaseAlert
     var alertIn: CaseAlert
     var once: Bool
+    var sepDistanceM: Double?
+    var sepMinObs: Int?
+    var sepLookbackH: Double?
+    var alertSeparated: CaseAlert?
+}
+
+/// Getrennt-Erkennung zwischen zwei AirPods-Teilen.
+struct SeparationPair: Codable, Hashable, Identifiable {
+    var a: String
+    var b: String
+    var state: String
+    var distance: Double?
+    var observations: Int
+    var streak: Int
+    var since: Double?
+    var lastTs: Double?
+    var id: String { a + "-" + b }
+}
+
+/// Wert, der als Bool, Zahl oder Text kommen kann (Apple ist da uneinheitlich).
+struct Flex: Codable, Hashable {
+    var text: String?
+    var number: Double?
+    var bool: Bool?
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let b = try? c.decode(Bool.self) { bool = b }
+        else if let n = try? c.decode(Double.self) { number = n; bool = n != 0 }
+        else if let s = try? c.decode(String.self) { text = s; bool = ["true", "1", "yes"].contains(s.lowercased()) }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        if let bool { try c.encode(bool) } else if let number { try c.encode(number) } else { try c.encode(text) }
+    }
+    var isTrue: Bool { bool ?? false }
+    var display: String {
+        if let text { return text }
+        if let number { return number == number.rounded() ? String(Int(number)) : String(format: "%.1f", number) }
+        if let bool { return bool ? "Ja" : "Nein" }
+        return "–"
+    }
+}
+
+struct AudioChannel: Codable, Hashable {
+    var name: Flex?
+    var available: Flex?
+    var playing: Flex?
+    var muted: Flex?
+}
+
+/// Zusatzinfos von iCloud „Geräte suchen“ (alles optional & tolerant).
+struct DeviceExtra: Codable, Hashable {
+    var lowPowerMode: Flex?
+    var batteryStatus: Flex?
+    var altitude: Flex?
+    var verticalAccuracy: Flex?
+    var floorLevel: Flex?
+    var positionType: Flex?
+    var locationEnabled: Flex?
+    var isLocating: Flex?
+    var lostModeCapable: Flex?
+    var lostModeEnabled: Flex?
+    var lostMessage: Flex?
+    var lostNumber: Flex?
+    var activationLocked: Flex?
+    var canSound: Flex?
+    var canMessage: Flex?
+    var canLocate: Flex?
+    var canLost: Flex?
+    var deviceColor: Flex?
+    var modelDisplayName: Flex?
+    var owner: Flex?
+    var family: Flex?
+    var audioChannels: [AudioChannel]?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func f(_ k: CodingKeys) -> Flex? { (try? c.decodeIfPresent(Flex.self, forKey: k)) ?? nil }
+        lowPowerMode = f(.lowPowerMode); batteryStatus = f(.batteryStatus); altitude = f(.altitude)
+        verticalAccuracy = f(.verticalAccuracy); floorLevel = f(.floorLevel); positionType = f(.positionType)
+        locationEnabled = f(.locationEnabled); isLocating = f(.isLocating); lostModeCapable = f(.lostModeCapable)
+        lostModeEnabled = f(.lostModeEnabled); lostMessage = f(.lostMessage); lostNumber = f(.lostNumber)
+        activationLocked = f(.activationLocked); canSound = f(.canSound); canMessage = f(.canMessage)
+        canLocate = f(.canLocate); canLost = f(.canLost); deviceColor = f(.deviceColor)
+        modelDisplayName = f(.modelDisplayName); owner = f(.owner); family = f(.family)
+        audioChannels = (try? c.decodeIfPresent([AudioChannel].self, forKey: .audioChannels)) ?? nil
+    }
 }
 struct AppleSettings: Codable, Hashable {
     var caseConfig: CaseConfig
@@ -302,6 +390,8 @@ struct AppleDevice: Codable, Identifiable, Hashable {
     var activeSession: Recording?
     var sessionsCount: Int?
     var onlinePoints: Int?
+    var extra: DeviceExtra?
+    var separation: [SeparationPair]?
 
     var isAirPods: Bool { mode == "airpods" }
     var isCloud: Bool { kind == "fmip" }

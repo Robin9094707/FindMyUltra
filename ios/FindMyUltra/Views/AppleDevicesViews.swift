@@ -347,6 +347,7 @@ struct AppleDeviceDetailView: View {
                         actions(d)
                         if d.isAirPods { CaseStatusCard(device: d) }
                         locationsCard(d)
+                        DeviceStatusCard(device: d)
                         RecordingsCard(device: d)
                         offlineCard(d)
                         DataSourcesCard(device: d)
@@ -524,6 +525,10 @@ struct AppleDeviceDetailView: View {
                         Text(r.label).font(.subheadline.weight(.semibold))
                         Text(p == nil ? "Keine Datei importiert" : "Importiert · \(p?.total ?? 0) Standorte")
                             .font(.caption).foregroundStyle(p == nil ? Color.secondary : Color.green)
+                        if r != .main, let t = p?.statusType, t != "airpods" {
+                            Text("Statusbyte meldet „\(t == "airtag" ? "AirTag" : t == "apple" ? "Apple-Gerät" : "Fremdhersteller")“ – evtl. falsche Datei?")
+                                .font(.caption2).foregroundStyle(.orange)
+                        }
                     }
                     Spacer()
                     Menu {

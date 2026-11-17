@@ -10,6 +10,8 @@ struct RecordingsCard: View {
     @State private var showAll = false
 
     private var list: [Recording] { model.recordings[device.id] ?? [] }
+    @State private var renameTarget: Recording?
+    @State private var newName = ""
 
     var body: some View {
         GlassSection(title: "Standortverlauf", systemImage: "record.circle") {
@@ -41,6 +43,10 @@ struct RecordingsCard: View {
                 ForEach(showAll ? past : Array(past.prefix(5))) { r in
                     Button { model.openRecording(r.id) } label: { RecordingRow(rec: r) }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button { renameTarget = r; newName = r.name } label: { Label("Umbenennen", systemImage: "pencil") }
+                            Button(role: .destructive) { Task { await delete(r) } } label: { Label("Löschen", systemImage: "trash") }
+                        }
                 }
                 if past.count > 5 && !showAll {
                     Button("Alle \(past.count) anzeigen") { showAll = true }.buttonStyle(.glass)
@@ -55,6 +61,27 @@ struct RecordingsCard: View {
             NavigationStack { StartRecordingView(device: device) }
                 .presentationDetents([.medium, .large])
         }
+        .alert("Aufzeichnung umbenennen", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } })) {
+            TextField("Name", text: $newName)
+            Button("Sichern") {
+                if let r = renameTarget { Task { await rename(r) } }
+            }
+            Button("Abbrechen", role: .cancel) { renameTarget = nil }
+        }
+    }
+
+    private func rename(_ r: Recording) async {
+        let _: Recording? = try? await model.api?.send("PATCH", "/api/sessions/\(r.id)", json: ["name": newName])
+        renameTarget = nil
+        Haptics.success()
+        await model.loadRecordings(device.id)
+    }
+
+    private func delete(_ r: Recording) async {
+        let _: OKResult? = try? await model.api?.send("DELETE", "/api/sessions/\(r.id)")
+        Haptics.success()
+        model.showToast("Aufzeichnung gelöscht")
+        await model.loadRecordings(device.id)
     }
 
     private func activeBanner(_ a: Recording) -> some View {
@@ -259,7 +286,8 @@ struct CaseStatusCard: View {
                 Text("Importiere die Schlüsseldateien für links, rechts und Case, damit der Status geschätzt werden kann.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
-            Text("Ohrhörer senden eigene Wo-ist-Signale vor allem, wenn sie außerhalb des Case sind. Wird ein Ohrhörer frisch offline geortet ⇒ „draußen“. Meldet sich danach nur noch das Case ⇒ „im Case“.")
+            if let sep = device.separation, !sep.isEmpty { SeparationView(pairs: sep) }
+            Text("Ohrhörer senden eigene Wo-ist-Signale vor allem, wenn sie außerhalb des Case sind. Wird ein Ohrhörer frisch offline geortet ⇒ „draußen“. Meldet sich danach nur noch das Case ⇒ „im Case“. Liefert iCloud aktive Audiokanäle, fließen diese mit ein. „Getrennt“ gilt erst nach mehreren Ortungen an verschiedenen Orten zur gleichen Zeit.")
                 .font(.caption).foregroundStyle(.secondary)
 
             if let c = cfg {
@@ -269,6 +297,19 @@ struct CaseStatusCard: View {
                 if c.alertOut.enabled { LevelPicker(title: "Stufe", level: bind(\.alertOut.level)) }
                 Toggle("Wieder ins Case gelegt", isOn: bind(\.alertIn.enabled))
                 if c.alertIn.enabled { LevelPicker(title: "Stufe", level: bind(\.alertIn.level)) }
+                Toggle("Teile getrennt (z. B. links woanders)", isOn: Binding(
+                    get: { cfg?.alertSeparated?.enabled ?? false },
+                    set: { cfg?.alertSeparated = CaseAlert(enabled: $0, level: cfg?.alertSeparated?.level ?? "timeSensitive"); Haptics.selection() }))
+                if cfg?.alertSeparated?.enabled == true {
+                    LevelPicker(title: "Stufe", level: Binding(get: { cfg?.alertSeparated?.level ?? "timeSensitive" },
+                                                               set: { cfg?.alertSeparated?.level = $0 }))
+                }
+                Stepper("Getrennt ab \(Int(cfg?.sepDistanceM ?? 150)) m", value: Binding(
+                    get: { cfg?.sepDistanceM ?? 150 }, set: { cfg?.sepDistanceM = $0 }), in: 50...2000, step: 50)
+                    .font(.subheadline)
+                Stepper("… bestätigt nach \(cfg?.sepMinObs ?? 2) Ortungen", value: Binding(
+                    get: { cfg?.sepMinObs ?? 2 }, set: { cfg?.sepMinObs = $0 }), in: 1...10)
+                    .font(.subheadline)
                 Toggle("Nur einmalig benachrichtigen", isOn: bind(\.once))
                 Stepper("„Draußen“ wenn geortet in den letzten \(Int(c.windowMin)) min", value: bind(\.windowMin), in: 5...180, step: 5)
                     .font(.subheadline)
@@ -314,11 +355,13 @@ struct CaseStatusCard: View {
         guard let c = cfg, let api = model.api else { return }
         saving = true
         defer { saving = false }
-        let body: [String: Any] = [
-            "settings": ["case": ["window_min": c.windowMin, "once": c.once,
-                                  "alert_out": ["enabled": c.alertOut.enabled, "level": c.alertOut.level],
-                                  "alert_in": ["enabled": c.alertIn.enabled, "level": c.alertIn.level]]],
-            "rearm": rearm]
+        var caseBody: [String: Any] = ["window_min": c.windowMin, "once": c.once,
+                                       "alert_out": ["enabled": c.alertOut.enabled, "level": c.alertOut.level],
+                                       "alert_in": ["enabled": c.alertIn.enabled, "level": c.alertIn.level]]
+        if let v = c.sepDistanceM { caseBody["sep_distance_m"] = v }
+        if let v = c.sepMinObs { caseBody["sep_min_obs"] = v }
+        if let a = c.alertSeparated { caseBody["alert_separated"] = ["enabled": a.enabled, "level": a.level] }
+        let body: [String: Any] = ["settings": ["case": caseBody], "rearm": rearm]
         do {
             let _: AppleDevice = try await api.send("PATCH", "/api/apple-devices/\(APIClient.seg(device.id))", json: body)
             await model.reloadAppleDevices()
@@ -370,6 +413,8 @@ struct RecordingDetailView: View {
     @State private var confirmDelete = false
     @State private var gpxURL: URL?
     @State private var showAllRows = false
+    @State private var renaming = false
+    @State private var newName = ""
 
     private var rec: Recording? { model.recording }
     private var device: AppleDevice? { rec.flatMap { model.appleDevice($0.appleId) } }
@@ -413,6 +458,11 @@ struct RecordingDetailView: View {
             }
         }
         .onChange(of: model.track) { _, _ in writeGPX() }
+        .alert("Aufzeichnung umbenennen", isPresented: $renaming) {
+            TextField("Name", text: $newName)
+            Button("Sichern") { Task { await patch(["name": newName]) } }
+            Button("Abbrechen", role: .cancel) {}
+        }
         .confirmationDialog("Aufzeichnung löschen?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Löschen", role: .destructive) {
                 Task {
@@ -436,6 +486,10 @@ struct RecordingDetailView: View {
                             .background(.red, in: .capsule).foregroundStyle(.white)
                     }
                     Text(rec?.name ?? "Aufzeichnung").font(.title2.bold()).lineLimit(2)
+                    Button { newName = rec?.name ?? ""; renaming = true } label: {
+                        Image(systemName: "pencil.circle.fill").font(.title3).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
                 }
                 if let r = rec {
                     Text("\(device?.name ?? "") · \(r.sourceLabel)").foregroundStyle(.secondary)
