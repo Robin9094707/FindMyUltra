@@ -38,6 +38,13 @@ Nur für deine eigenen Geräte gedacht.
 
 from __future__ import annotations
 
+# ════════════════════════════════════════════════════════════════════════════
+#  ⚙️  HIER EINSTELLEN
+# ════════════════════════════════════════════════════════════════════════════
+PORT = 8787          # Port, auf dem der Server läuft (in der App: <IP>:<PORT>)
+HOST = "0.0.0.0"     # "0.0.0.0" = im ganzen Netzwerk erreichbar, "127.0.0.1" = nur lokal
+# (Kommandozeile --port/--host oder FMU_PORT/FMU_HOST überschreiben diese Werte)
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Bootstrap: fehlende Abhängigkeiten automatisch in eine .venv installieren
 # ────────────────────────────────────────────────────────────────────────────
@@ -2419,8 +2426,8 @@ def cert_fingerprint(cert_p: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="findmy_ultra.py", description=f"{APP_NAME} – Server für deine AirTags.")
-    p.add_argument("--host", default=os.environ.get("FMU_HOST", "0.0.0.0"))
-    p.add_argument("--port", type=int, default=int(os.environ.get("FMU_PORT", 8787)))
+    p.add_argument("--host", default=os.environ.get("FMU_HOST", HOST))
+    p.add_argument("--port", type=int, default=int(os.environ.get("FMU_PORT", PORT)))
     p.add_argument("--data", help="Datenordner (Standard: ./data neben dem Skript, oder $FMU_HOME)")
     p.add_argument("--import", dest="import_path", metavar="PFAD",
                    help="Schlüssel-Datei(en) (.json/.plist) oder Ordner beim Start importieren")
