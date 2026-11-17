@@ -48,6 +48,7 @@ struct SettingsView: View {
             if draft != nil {
                 pollingSection
                 historySection
+                staysSection
                 barkSection
                 zonesSection
             }
@@ -227,6 +228,28 @@ struct SettingsView: View {
             Text("Benachrichtigungen (Bark)")
         } footer: {
             Text("Installiere die App „Bark“, kopiere deine Push-URL (https://api.day.app/DEINKEY) und füge sie hier ein. Kritische Hinweise durchbrechen Stumm- und Fokus-Modus. Erst „Sichern“, dann testen.")
+        }
+    }
+
+    @ViewBuilder
+    private var staysSection: some View {
+        let d = draftBinding
+        if d.wrappedValue.stays != nil {
+            let st = Binding<StaysConfig>(get: { d.wrappedValue.stays! }, set: { d.wrappedValue.stays = $0 })
+            Section {
+                Stepper("Umkreis: \(Int(st.wrappedValue.radiusM)) m", value: st.radiusM, in: 30...1000, step: 10)
+                Stepper("Mindestdauer: \(Int(st.wrappedValue.minMinutes)) min", value: st.minMinutes, in: 1...240)
+                Stepper("Mind. Berichte: \(st.wrappedValue.minPoints)", value: st.minPoints, in: 1...20)
+                Stepper("Ausreißer tolerieren: \(st.wrappedValue.maxOutliers)", value: st.maxOutliers, in: 0...20)
+                Stepper("… innerhalb von \(Int(st.wrappedValue.outlierMinutes)) min", value: st.outlierMinutes, in: 5...240, step: 5)
+                Stepper("Zusammenfassen bis \(Int(st.wrappedValue.mergeMinutes)) min Lücke", value: st.mergeMinutes, in: 0...240, step: 5)
+                Stepper("Max. Funkstille: \(Int(st.wrappedValue.maxGapHours)) h", value: st.maxGapHours, in: 1...48)
+                Stepper("Ungenau ab: \(Int(st.wrappedValue.maxAccuracyM)) m", value: st.maxAccuracyM, in: 50...5000, step: 50)
+            } header: {
+                Text("Aufenthalte")
+            } footer: {
+                Text("Ein Aufenthalt ist ein Ort, an dem das Objekt mindestens die Mindestdauer im Umkreis war. Einzelne Ausreißer (falsche Ortungen) brechen ihn nicht ab, solange das Objekt danach wieder dort geortet wird. Ungenauere Berichte zählen nur, wenn sie in den Umkreis passen. Wird live aus allen Berichten berechnet.")
+            }
         }
     }
 

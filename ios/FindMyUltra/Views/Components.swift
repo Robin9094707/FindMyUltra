@@ -163,6 +163,26 @@ struct AirTagPin: View {
     }
 }
 
+/// Gelbes Etikett mit Aufenthaltsdauer auf der Karte.
+struct StayLabel: View {
+    let stay: Stay
+    let selected: Bool
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: stay.ongoing ? "figure.stand" : "clock.fill")
+            Text(formatDuration(stay.duration))
+        }
+        .font(.system(size: selected ? 13 : 11, weight: .bold))
+        .foregroundStyle(.black)
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.yellow, in: .capsule)
+        .overlay(Capsule().stroke(.white, lineWidth: selected ? 2.5 : 1.5))
+        .shadow(color: .black.opacity(0.3), radius: 3, y: 1)
+        .offset(y: -18)
+        .animation(.spring(duration: 0.25), value: selected)
+    }
+}
+
 /// Großer, gut sichtbarer Verlaufspunkt.
 struct HistoryDot: View {
     let color: Color

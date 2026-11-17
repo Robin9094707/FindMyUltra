@@ -4,6 +4,7 @@ import MapKit
 enum MapSel: Hashable {
     case device(String)
     case report(Int)
+    case stay(String)
 }
 
 struct Pin: Identifiable {
@@ -89,6 +90,7 @@ struct MapScreen: View {
                 switch sel {
                 case .device(let id): model.openDevice(id)
                 case .report(let rid): model.select(reportID: rid)
+                case .stay(let sid): if let st = model.stays.first(where: { $0.id == sid }) { model.select(stay: st) }
                 case nil: break
                 }
             }
@@ -109,18 +111,26 @@ struct MapScreen: View {
                         .foregroundStyle(.orange.opacity(0.08))
                         .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
                 }
-                // Genauigkeitskreise
+                // Aufenthalte (gelb)
+                if model.showStays {
+                    ForEach(model.stays) { st in
+                        MapCircle(center: st.coordinate, radius: st.radius)
+                            .foregroundStyle(Color.yellow.opacity(st.id == model.selectedStayID ? 0.32 : 0.2))
+                            .stroke(Color.yellow, lineWidth: st.id == model.selectedStayID ? 3 : 2)
+                    }
+                }
+                // Genauigkeitskreise (blau)
                 if model.circleMode == .all {
                     ForEach(dots, id: \.report.id) { item in
                         MapCircle(center: item.report.coordinate, radius: CLLocationDistance(max(item.report.accuracy ?? 5, 5)))
-                            .foregroundStyle(d.tint.opacity(0.06))
-                            .stroke(d.tint.opacity(0.35), lineWidth: 0.8)
+                            .foregroundStyle(Color.blue.opacity(0.06))
+                            .stroke(Color.blue.opacity(0.4), lineWidth: 0.8)
                     }
                 }
                 if model.circleMode != .off, let r = model.cursorReport {
                     MapCircle(center: r.coordinate, radius: CLLocationDistance(max(r.accuracy ?? 5, 5)))
-                        .foregroundStyle(d.tint.opacity(0.18))
-                        .stroke(d.tint, lineWidth: 1.5)
+                        .foregroundStyle(Color.blue.opacity(0.16))
+                        .stroke(Color.blue, lineWidth: 1.5)
                 }
                 // Spur
                 if model.track.count > 1 {
@@ -137,14 +147,24 @@ struct MapScreen: View {
                     .tag(MapSel.report(item.report.id))
                     .annotationTitles(.hidden)
                 }
+                // Aufenthalts-Etiketten (antippbar)
+                if model.showStays {
+                    ForEach(model.stays) { st in
+                        Annotation("", coordinate: st.coordinate, anchor: .center) {
+                            StayLabel(stay: st, selected: st.id == model.selectedStayID)
+                        }
+                        .tag(MapSel.stay(st.id))
+                        .annotationTitles(.hidden)
+                    }
+                }
             }
 
             // Objekte (AirTag-Pins)
             ForEach(pins) { p in
                 if model.circleMode != .off && p.device.id != model.focusedID {
                     MapCircle(center: p.report.coordinate, radius: CLLocationDistance(max(p.report.accuracy ?? 5, 5)))
-                        .foregroundStyle(p.device.tint.opacity(0.1))
-                        .stroke(p.device.tint.opacity(0.4), lineWidth: 1)
+                        .foregroundStyle(Color.blue.opacity(0.1))
+                        .stroke(Color.blue.opacity(0.45), lineWidth: 1)
                 }
                 Annotation(p.device.name, coordinate: p.report.coordinate, anchor: .bottom) {
                     AirTagPin(device: p.device,
@@ -171,6 +191,7 @@ struct MapScreen: View {
                     Picker("Genauigkeitskreise", selection: Binding(get: { model.circleMode }, set: { model.circleMode = $0 })) {
                         ForEach(CircleMode.allCases) { Text("Kreise: \($0.label)").tag($0) }
                     }
+                    Toggle("Aufenthalte anzeigen", isOn: Binding(get: { model.showStays }, set: { model.showStays = $0; Haptics.light() }))
                 } label: {
                     Image(systemName: style == .standard ? "map" : "map.fill")
                         .frame(width: 46, height: 44)

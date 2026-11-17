@@ -90,6 +90,7 @@ struct DeviceDetailView: View {
                 if d.lost.enabled { lostBanner(d) }
                 actions(d)
                 historyCard(d)
+                StaysCard()
                 if let r = model.cursorReport { pointCard(r, d) }
                 infoCard(d)
                 pointList(d)

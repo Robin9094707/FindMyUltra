@@ -143,6 +143,55 @@ struct BarkConfig: Codable, Hashable {
 
 struct QuietHours: Codable, Hashable { var enabled: Bool; var start: String; var end: String }
 
+struct StaysConfig: Codable, Hashable {
+    var radiusM: Double
+    var minMinutes: Double
+    var minPoints: Int
+    var maxOutliers: Int
+    var outlierMinutes: Double
+    var maxGapHours: Double
+    var maxAccuracyM: Double
+    var mergeMinutes: Double
+}
+
+/// Aufenthalt an einem Ort (vom Server aus den Berichten berechnet).
+struct Stay: Codable, Identifiable, Hashable {
+    var id: String
+    var lat: Double
+    var lon: Double
+    var radius: Double
+    var start: Double
+    var end: Double
+    var duration: Double
+    var leftAt: Double?
+    var points: Int
+    var outliers: Int
+    var firstReportId: Int?
+    var lastReportId: Int?
+    var ongoing: Bool
+    var placeId: String?
+    var coordinate: CLLocationCoordinate2D { .init(latitude: lat, longitude: lon) }
+    var startDate: Date { Date(timeIntervalSince1970: start) }
+    var endDate: Date { Date(timeIntervalSince1970: end) }
+}
+
+struct Place: Codable, Identifiable, Hashable {
+    var id: String
+    var lat: Double
+    var lon: Double
+    var visits: Int
+    var totalDuration: Double
+    var lastSeen: Double
+    var radius: Double
+    var coordinate: CLLocationCoordinate2D { .init(latitude: lat, longitude: lon) }
+}
+
+struct StaysResponse: Codable {
+    var stays: [Stay]
+    var places: [Place]
+    var totalStayTime: Double
+}
+
 struct ServerSettings: Codable, Hashable {
     var pollInterval: Int
     var lostPollInterval: Int
@@ -155,6 +204,7 @@ struct ServerSettings: Codable, Hashable {
     var zones: [Zone]
     var bark: BarkConfig
     var quietHours: QuietHours
+    var stays: StaysConfig?
 }
 
 struct Passkey: Codable, Identifiable, Hashable {
@@ -297,6 +347,16 @@ extension Date {
     var timeDE: String {
         formatted(.dateTime.hour().minute().second().locale(Locale(identifier: "de_DE")))
     }
+}
+
+func formatDuration(_ s: Double) -> String {
+    let m = Int((s / 60).rounded())
+    if m < 1 { return "< 1 min" }
+    if m < 60 { return "\(m) min" }
+    let h = m / 60, rm = m % 60
+    if h < 24 { return rm == 0 ? "\(h) h" : "\(h) h \(rm) min" }
+    let d = h / 24, rh = h % 24
+    return rh == 0 ? "\(d) T" : "\(d) T \(rh) h"
 }
 
 func formatDistance(_ m: Double) -> String {

@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -210,6 +210,16 @@ DEFAULT_SETTINGS: dict = {
         "min_level": "passive",
     },
     "quiet_hours": {"enabled": False, "start": "23:00", "end": "07:00"},
+    "stays": {                    # Aufenthalte / stationäre Orte
+        "radius_m": 120,          # max. Abstand zum Mittelpunkt, um als „gleicher Ort“ zu zählen
+        "min_minutes": 5,         # Mindestdauer eines Aufenthalts
+        "min_points": 2,          # Mindestanzahl Berichte
+        "max_outliers": 3,        # so viele Ausreißer in Folge werden toleriert …
+        "outlier_minutes": 30,    # … solange sie zusammen nicht länger als X min dauern
+        "max_gap_hours": 12,      # längere Funkstille am selben Ort trennt Aufenthalte
+        "max_accuracy_m": 500,    # ungenauere Berichte zählen nur, wenn sie hineinpassen
+        "merge_minutes": 45,      # Aufenthalte am selben Ort mit kurzer Lücke zusammenfassen
+    },
 }
 
 DEFAULT_ALERTS: dict = {
@@ -1163,6 +1173,164 @@ def index_range(acc: Any, mode: str, quick_hours: float) -> tuple[int, int]:
 #  Benachrichtigungen (Bark) & Alarme
 # ════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Aufenthalte (Stay-Point-Erkennung mit Ausreißer-Toleranz)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _weighted_center(pts: list[dict]) -> tuple[float, float]:
+    """Gewichteter Mittelpunkt (genauere Berichte zählen mehr), robust per Median-Vorfilter."""
+    if len(pts) >= 5:
+        mlat = sorted(p["lat"] for p in pts)[len(pts) // 2]
+        mlon = sorted(p["lon"] for p in pts)[len(pts) // 2]
+        dists = sorted(haversine(mlat, mlon, p["lat"], p["lon"]) for p in pts)
+        cut = max(dists[int(len(dists) * 0.8)] * 1.5, 30)
+        core = [p for p in pts if haversine(mlat, mlon, p["lat"], p["lon"]) <= cut] or pts
+    else:
+        core = pts
+    w = [1.0 / max(float(p.get("accuracy") or 50), 5.0) ** 2 for p in core]
+    tw = sum(w)
+    return (sum(p["lat"] * x for p, x in zip(core, w)) / tw,
+            sum(p["lon"] * x for p, x in zip(core, w)) / tw)
+
+
+def compute_stays(reports: list[dict], cfg: dict, now_ts: float | None = None) -> dict:
+    """
+    Erkennt Aufenthalte („stationäre Orte“) aus einer Berichtsliste.
+
+    * Ein Aufenthalt beginnt mit einem genauen Bericht; folgende Berichte innerhalb
+      radius (+ halbe Ungenauigkeit) gehören dazu, der Mittelpunkt wird laufend
+      gewichtet neu berechnet.
+    * Bis zu max_outliers Berichte außerhalb, die zusammen höchstens
+      outlier_minutes dauern, gelten als Ausreißer, wenn danach wieder ein Bericht
+      am Ort folgt – sie brechen den Aufenthalt nicht.
+    * Ungenaue Berichte (> max_accuracy_m) zählen mit, wenn sie passen, sonst
+      werden sie ignoriert (weder Ausreißer noch Abbruch).
+    * Funkstille > max_gap_hours trennt; Aufenthalte am selben Ort mit
+      Lücke ≤ merge_minutes werden zusammengefasst.
+    * Häufige Orte: Aufenthalte mit nahen Mittelpunkten bilden „Orte“ mit
+      Besuchsanzahl und Gesamtdauer.
+    """
+    radius = float(cfg.get("radius_m", 120))
+    min_dur = float(cfg.get("min_minutes", 5)) * 60
+    min_pts = int(cfg.get("min_points", 2))
+    max_out = int(cfg.get("max_outliers", 3))
+    out_win = float(cfg.get("outlier_minutes", 30)) * 60
+    max_gap = float(cfg.get("max_gap_hours", 12)) * 3600
+    max_acc = float(cfg.get("max_accuracy_m", 500))
+    merge_gap = float(cfg.get("merge_minutes", 45)) * 60
+    now_ts = now_ts or now()
+    pts = sorted(reports, key=lambda r: r["ts"])
+
+    def fits(c: dict, p: dict) -> bool:
+        acc = float(p.get("accuracy") or 0)
+        return haversine(c["lat"], c["lon"], p["lat"], p["lon"]) <= radius + min(acc, radius) * 0.5
+
+    clusters: list[dict] = []
+    cur: dict | None = None
+    pending: list[dict] = []
+
+    def close() -> None:
+        nonlocal cur
+        if cur is not None:
+            clusters.append(cur)
+        cur = None
+
+    def start(p: dict) -> dict:
+        return {"pts": [p], "lat": p["lat"], "lon": p["lon"], "outliers": 0, "next_ts": None}
+
+    queue = list(pts)
+    i = 0
+    while i < len(queue):
+        p = queue[i]
+        i += 1
+        weak = float(p.get("accuracy") or 0) > max_acc
+        if cur is None:
+            if not weak:
+                cur = start(p)
+            continue
+        if p["ts"] - cur["pts"][-1]["ts"] > max_gap and not pending:
+            close()
+            if not weak:
+                cur = start(p)
+            continue
+        if fits(cur, p):
+            if pending:
+                cur["outliers"] += len([x for x in pending if float(x.get("accuracy") or 0) <= max_acc])
+                pending = []
+            cur["pts"].append(p)
+            cur["lat"], cur["lon"] = _weighted_center(cur["pts"])
+            continue
+        if weak:
+            continue  # ungenauer Bericht außerhalb: ignorieren
+        pending.append(p)
+        if len(pending) > max_out or pending[-1]["ts"] - pending[0]["ts"] > out_win \
+                or pending[0]["ts"] - cur["pts"][-1]["ts"] > max_gap:
+            cur["next_ts"] = pending[0]["ts"]
+            close()
+            # Ausstehende Berichte neu auswerten – sie können einen neuen Aufenthalt bilden
+            queue[i:i] = pending
+            pending = []
+    if cur is not None:
+        if pending:
+            cur["next_ts"] = pending[0]["ts"]
+        clusters.append(cur)
+
+    # Zusammenfassen: gleicher Ort, kurze Lücke
+    merged: list[dict] = []
+    for c in clusters:
+        if merged:
+            m = merged[-1]
+            gap = c["pts"][0]["ts"] - m["pts"][-1]["ts"]
+            if gap <= merge_gap and haversine(m["lat"], m["lon"], c["lat"], c["lon"]) <= radius:
+                m["pts"] += c["pts"]
+                m["outliers"] += c["outliers"]
+                m["next_ts"] = c["next_ts"]
+                m["lat"], m["lon"] = _weighted_center(m["pts"])
+                continue
+        merged.append(c)
+
+    last_ts = pts[-1]["ts"] if pts else None
+    stays = []
+    for c in merged:
+        cp = c["pts"]
+        dur = cp[-1]["ts"] - cp[0]["ts"]
+        if len(cp) < min_pts or dur < min_dur:
+            continue
+        d = sorted(haversine(c["lat"], c["lon"], p["lat"], p["lon"]) for p in cp)
+        spread = d[min(len(d) - 1, int(len(d) * 0.9))]
+        accs = sorted(float(p.get("accuracy") or 0) for p in cp)
+        ongoing = cp[-1]["ts"] == last_ts and c["next_ts"] is None and now_ts - cp[-1]["ts"] < 6 * 3600
+        stays.append({
+            "id": f"{int(cp[0]['ts'])}-{len(cp)}",
+            "lat": round(c["lat"], 7), "lon": round(c["lon"], 7),
+            "radius": round(max(25.0, min(spread + accs[len(accs) // 2] * 0.5, radius * 1.5)), 1),
+            "start": cp[0]["ts"], "end": cp[-1]["ts"], "duration": dur,
+            "left_at": c["next_ts"], "points": len(cp), "outliers": c["outliers"],
+            "first_report_id": cp[0].get("id"), "last_report_id": cp[-1].get("id"),
+            "ongoing": bool(ongoing), "place_id": None,
+        })
+
+    # Häufige Orte
+    places: list[dict] = []
+    for st in sorted(stays, key=lambda x: -x["duration"]):
+        pl = next((p for p in places if haversine(p["lat"], p["lon"], st["lat"], st["lon"]) <= radius), None)
+        if pl is None:
+            pl = {"id": f"p{len(places) + 1}", "lat": st["lat"], "lon": st["lon"], "visits": 0,
+                  "total_duration": 0.0, "last_seen": 0.0, "radius": st["radius"]}
+            places.append(pl)
+        pl["visits"] += 1
+        pl["total_duration"] += st["duration"]
+        pl["last_seen"] = max(pl["last_seen"], st["end"])
+        st["place_id"] = pl["id"]
+    places.sort(key=lambda p: -p["total_duration"])
+    stays.sort(key=lambda x: x["start"])
+    return {"stays": stays, "places": places,
+            "total_stay_time": sum(x["duration"] for x in stays), "params": {
+                "radius_m": radius, "min_minutes": min_dur / 60, "min_points": min_pts,
+                "max_outliers": max_out, "outlier_minutes": out_win / 60,
+                "max_gap_hours": max_gap / 3600, "max_accuracy_m": max_acc, "merge_minutes": merge_gap / 60}}
+
+
 class Notifier:
     def __init__(self, st: "State") -> None:
         self.st = st
@@ -1884,6 +2052,15 @@ def build_app(st: State) -> web.Application:
         s["day_sweep_minutes"] = max(2, int(s["day_sweep_minutes"]))
         s["full_sweep_minutes"] = max(10, int(s["full_sweep_minutes"]))
         s["retention_days"] = max(0, int(s["retention_days"]))
+        sc = s["stays"]
+        sc["radius_m"] = max(20.0, min(2000.0, float(sc["radius_m"])))
+        sc["min_minutes"] = max(1.0, float(sc["min_minutes"]))
+        sc["min_points"] = max(1, int(sc["min_points"]))
+        sc["max_outliers"] = max(0, int(sc["max_outliers"]))
+        sc["outlier_minutes"] = max(1.0, float(sc["outlier_minutes"]))
+        sc["max_gap_hours"] = max(0.5, float(sc["max_gap_hours"]))
+        sc["max_accuracy_m"] = max(20.0, float(sc["max_accuracy_m"]))
+        sc["merge_minutes"] = max(0.0, float(sc["merge_minutes"]))
         bark = s["bark"]
         keys = []
         for k in bark.get("device_keys", []):
@@ -2034,6 +2211,15 @@ def build_app(st: State) -> web.Application:
         return web.json_response({"reports": st.store.reports(
             _f(q.get("since")), _f(q.get("until")), req.match_info["id"], int(q.get("limit", 50000)))})
 
+    async def device_stays(req: web.Request) -> web.Response:
+        q = req.query
+        cfg = dict(st.store.settings().get("stays", {}))
+        for k in DEFAULT_SETTINGS["stays"]:
+            if q.get(k) not in (None, ""):
+                cfg[k] = float(q[k])
+        rows = st.store.reports(_f(q.get("since")), _f(q.get("until")), req.match_info["id"], 100000)
+        return web.json_response(compute_stays(rows, cfg))
+
     async def device_export_keys(req: web.Request) -> web.Response:
         t = st.registry.tracked.get(req.match_info["id"])
         if not t or st.args.demo:
@@ -2177,6 +2363,7 @@ def build_app(st: State) -> web.Application:
     r.add_patch("/api/devices/{id}", device_patch)
     r.add_delete("/api/devices/{id}", device_delete)
     r.add_get("/api/devices/{id}/reports", device_reports)
+    r.add_get("/api/devices/{id}/stays", device_stays)
     r.add_get("/api/devices/{id}/keys", device_export_keys)
     r.add_get("/api/reports", all_reports)
     r.add_post("/api/import", import_keys)

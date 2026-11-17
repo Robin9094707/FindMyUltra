@@ -80,6 +80,14 @@ final class AppModel {
         didSet { UserDefaults.standard.set(circleMode.rawValue, forKey: "circleMode") }
     }
     var followCursor = true
+    var stays: [Stay] = []
+    var places: [Place] = []
+    var totalStayTime: Double = 0
+    var selectedStayID: String?
+    var showStays: Bool = UserDefaults.standard.object(forKey: "showStays") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showStays, forKey: "showStays") }
+    }
+    private var staysTask: Task<Void, Never>?
     var cameraRegion: MKCoordinateRegion?
     var cameraTick = 0
     var thoroughRefresh: Bool = UserDefaults.standard.object(forKey: "thoroughRefresh") as? Bool ?? true {
@@ -306,6 +314,50 @@ final class AppModel {
         focusedID = nil
         track = []
         cursor = nil
+        stays = []; places = []; totalStayTime = 0; selectedStayID = nil
+    }
+
+    /// Aufenthalte neu berechnen lassen (leicht verzögert, damit Live-Batches gesammelt werden).
+    func reloadStays(delay: Double = 0) {
+        guard let id = focusedID, let api else { return }
+        staysTask?.cancel()
+        let since: Double? = historyRange == .all ? nil : Date().timeIntervalSince1970 - historyRange.rawValue
+        staysTask = Task {
+            if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+            if Task.isCancelled { return }
+            var q: [URLQueryItem] = []
+            if let since { q.append(.init(name: "since", value: String(since))) }
+            guard let r: StaysResponse = try? await api.get("/api/devices/\(id)/stays", query: q),
+                  !Task.isCancelled, focusedID == id else { return }
+            withAnimation(.smooth) {
+                stays = r.stays
+                places = r.places
+                totalStayTime = r.totalStayTime
+            }
+        }
+    }
+
+    func select(stay: Stay) {
+        Haptics.selection()
+        selectedStayID = stay.id
+        if let rid = stay.lastReportId, let i = track.firstIndex(where: { $0.id == rid }) {
+            let follow = followCursor
+            followCursor = false
+            cursor = i
+            followCursor = follow
+        }
+        show(center: stay.coordinate, meters: max(400, stay.radius * 6))
+    }
+
+    func address(lat: Double, lon: Double) async -> String? {
+        let key = String(format: "%.4f,%.4f", lat, lon)
+        if let a = addresses[key] { return a }
+        guard let p = try? await CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: lat, longitude: lon)).first
+        else { return nil }
+        let street = [p.thoroughfare, p.subThoroughfare].compactMap { $0 }.joined(separator: " ")
+        let s = [p.areasOfInterest?.first ?? (street.isEmpty ? p.name : street), p.locality].compactMap { $0 }.joined(separator: ", ")
+        addresses[key] = s
+        return s
     }
 
     func reloadTrack(_ id: String, keepCursor: Bool) async {
@@ -315,6 +367,7 @@ final class AppModel {
         track = r
         if !keepCursor || wasAtEnd { cursor = r.isEmpty ? nil : r.count - 1 }
         else if let c = cursor, c >= r.count { cursor = r.count - 1 }
+        reloadStays()
     }
 
     var cursorReport: Report? {
@@ -378,7 +431,7 @@ final class AppModel {
     func address(for r: Report) async -> String? {
         let key = String(format: "%.4f,%.4f", r.lat, r.lon)
         if let a = addresses[key] { return a }
-        guard let p = try? await geocoder.reverseGeocodeLocation(CLLocation(latitude: r.lat, longitude: r.lon)).first
+        guard let p = try? await CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: r.lat, longitude: r.lon)).first
         else { return nil }
         let street = [p.thoroughfare, p.subThoroughfare].compactMap { $0 }.joined(separator: " ")
         let s = [street.isEmpty ? p.name : street, p.locality].compactMap { $0 }.joined(separator: ", ")
@@ -444,6 +497,7 @@ final class AppModel {
                     track = t
                     if atEnd { cursor = t.isEmpty ? nil : t.count - 1 }
                     Haptics.light()
+                    reloadStays(delay: 1.5)
                 }
             }
         case "settings":
