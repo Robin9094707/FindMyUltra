@@ -240,8 +240,11 @@ struct ToastView: View {
     let text: String
     var body: some View {
         Text(text)
-            .font(.subheadline.weight(.semibold))
-            .padding(.horizontal, 18).padding(.vertical, 12)
+            .font(.footnote.weight(.semibold))
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .frame(maxWidth: 320)
             .glassEffect(.regular, in: .capsule)
             .transition(.move(edge: .top).combined(with: .opacity))
     }

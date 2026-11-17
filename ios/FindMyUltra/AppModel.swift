@@ -394,8 +394,10 @@ final class AppModel {
             if let d = r.devices { appleDevices = d }
             onlineStatus = r.online ?? onlineStatus
             await reloadDevices()
-            if let e = r.onlineError, onlineStatus?.enabled == true {
-                Haptics.warning(); showToast("Online: \(e)")
+            if r.onlineError != nil, onlineStatus?.enabled == true {
+                Haptics.light()
+                let n = r.newOffline ?? 0
+                showToast(n > 0 ? "\(n) neue Offline-Standorte · Online nicht verfügbar" : "Aktualisiert · Online nicht verfügbar")
             } else {
                 Haptics.success()
                 let n = r.newOffline ?? 0

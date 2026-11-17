@@ -49,7 +49,7 @@ struct FindSheet: View {
         }
         .overlay(alignment: .top) {
             if let t = model.toast {
-                ToastView(text: t).padding(.top, 10)
+                ToastView(text: t).padding(.top, 6)
             }
         }
         .animation(.spring(duration: 0.4), value: model.toast)

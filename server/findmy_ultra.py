@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1297,6 +1297,8 @@ class OnlineDevices:
         self.failures = 0
         self.event = asyncio.Event()
         self.lock = asyncio.Lock()
+        self.force_ipv4 = bool(st.store.kv_get("fmip_ipv4", False))
+        self.http4: ClientSession | None = None
         self.udid = st.store.kv_get("fmip_udid") or secrets.token_hex(20)
         st.store.kv_set("fmip_udid", self.udid)
 
@@ -1328,7 +1330,31 @@ class OnlineDevices:
         }
         with contextlib.suppress(Exception):
             headers.update(await self.st.apple.account.get_anisette_headers())
-        s = await self.st.notifier.session()
+        try:
+            return await self._post_with(await self._session(self.force_ipv4), path, body, headers, dsid, tok)
+        except aiohttp.ClientConnectorError as e:
+            if self.force_ipv4:
+                raise
+            # Häufig: Netz liefert IPv6-Adresse, Server hat aber kein IPv6 → nur IPv4 versuchen
+            log.info("FMIP über Standardverbindung nicht erreichbar (%s) – versuche IPv4.", e)
+            res = await self._post_with(await self._session(True), path, body, headers, dsid, tok)
+            self.force_ipv4 = True
+            self.st.store.kv_set("fmip_ipv4", True)
+            return res
+
+    async def _session(self, ipv4: bool) -> ClientSession:
+        import aiohttp
+        if not ipv4:
+            return await self.st.notifier.session()
+        if self.http4 is None or self.http4.closed:
+            self.http4 = ClientSession(timeout=ClientTimeout(total=25),
+                                       connector=aiohttp.TCPConnector(family=socket.AF_INET),
+                                       headers={"User-Agent": f"FindMyUltra/{VERSION}"})
+        return self.http4
+
+    async def _post_with(self, s: ClientSession, path: str, body: dict, headers: dict,
+                         dsid: str, tok: str) -> dict:
+        import aiohttp
         for _ in range(3):
             url = f"https://{self.host}/fmipservice/device/{dsid}/{path}"
             async with s.post(url, json=body, headers=headers, auth=aiohttp.BasicAuth(dsid, tok)) as r:
@@ -1392,9 +1418,21 @@ class OnlineDevices:
                 return len(items)
             except Exception as e:  # noqa: BLE001
                 self.failures += 1
-                self.error = f"{type(e).__name__}: {e}"
-                log.warning("Online-Ortung fehlgeschlagen: %s", self.error)
+                self.error = self._friendly(e)
+                log.warning("Online-Ortung fehlgeschlagen: %s (%s)", self.error, e)
                 return 0
+
+    @staticmethod
+    def _friendly(e: Exception) -> str:
+        import aiohttp
+        if isinstance(e, aiohttp.ClientConnectorError):
+            return ("Der Server erreicht iCloud („Wo ist?“) nicht – Netzwerk/Firewall/DNS prüfen. "
+                    "(IPv4 wurde bereits versucht.)")
+        if isinstance(e, asyncio.TimeoutError):
+            return "Zeitüberschreitung bei iCloud – später erneut versuchen."
+        if isinstance(e, PermissionError):
+            return "Apple hat die Online-Abfrage abgelehnt – Apple-Account ggf. neu anmelden."
+        return f"{type(e).__name__}: {e}"
 
     async def play_sound(self, aid: str) -> None:
         await self._post("playSound", {**self._context(), "device": aid,
