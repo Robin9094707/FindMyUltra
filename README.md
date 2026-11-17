@@ -19,7 +19,7 @@ python3 findmy_ultra.py --self-signed  # HTTPS mit selbstsigniertem Zertifikat (
 python3 findmy_ultra.py --demo         # Demo-Daten zum Ausprobieren, ohne Apple
 ```
 
-Du brauchst Python 3.10 oder neuer. Die Konsole zeigt die Adressen (z. B. `http://192.168.1.20:8787`) und **beim ersten Start Benutzer und Passwort**. Beides steht auch in `server/data/ERSTES-PASSWORT.txt`.
+Du brauchst Python 3.10 oder neuer. Die Konsole zeigt die Adressen (z. B. `http://192.168.1.20:5070`) und **beim ersten Start Benutzer und Passwort**. Beides steht auch in `server/data/ERSTES-PASSWORT.txt`.
 
 | Datei in `server/data/` | Inhalt |
 |---|---|
@@ -28,15 +28,15 @@ Du brauchst Python 3.10 oder neuer. Die Konsole zeigt die Adressen (z. B. `http:
 | `accessories/*.json` | Importierte AirTag-Schlüssel (inkl. aktueller Schlüssel-Ausrichtung) |
 | `findmy_ultra.sqlite3` | Standortverlauf, Geräte, Alarme, Einstellungen |
 
-Optionen: `--port 8787`, `--host`, `--data DIR`, `--import DATEI|ORDNER`, `--tls-cert/--tls-key`, `--trust-proxy` (hinter Caddy, nginx oder Cloudflare), `--reset-password`.
+Optionen: `--port 5070`, `--host`, `--data DIR`, `--import DATEI|ORDNER`, `--tls-cert/--tls-key`, `--trust-proxy` (hinter Caddy, nginx oder Cloudflare), `--reset-password`.
 
-**HTTP über IP:Port funktioniert** (die App erlaubt lokale und unverschlüsselte Verbindungen). Für **Passkeys** brauchst du eine HTTPS-Domain mit gültigem Zertifikat, z. B. über `caddy reverse-proxy --from findmy.example.com --to :8787`, Tailscale Serve oder einen Cloudflare Tunnel. Starte den Server dann mit `--trust-proxy`.
+**HTTP über IP:Port funktioniert** (die App erlaubt lokale und unverschlüsselte Verbindungen). Für **Passkeys** brauchst du eine HTTPS-Domain mit gültigem Zertifikat, z. B. über `caddy reverse-proxy --from findmy.example.com --to :5070`, Tailscale Serve oder einen Cloudflare Tunnel. Starte den Server dann mit `--trust-proxy`.
 
 ## 2. App installieren
 
 1. Unter **Actions → „iOS IPA“** findest du `FindMyUltra-ipa` als Artefakt. Bei einem Tag `v*` landet die IPA zusätzlich im Release.
 2. Sideloade sie mit AltStore, SideStore, Sideloadly oder TrollStore.
-3. Gib in der App die Server-Adresse ein (`https://…` oder `192.168.1.20:8787`) und melde dich mit dem Server-Login an.
+3. Gib in der App die Server-Adresse ein (`https://…` oder `192.168.1.20:5070`) und melde dich mit dem Server-Login an.
 4. **Einstellungen → Apple-Account**: Apple-ID und Passwort eingeben, dann den 2FA-Code bestätigen (vertrauenswürdiges Gerät oder SMS).
 5. **Einstellungen → Schlüssel importieren**: deine `.json`- oder `.plist`-Dateien auswählen (mehrere gleichzeitig möglich).
 

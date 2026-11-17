@@ -7,8 +7,41 @@ import UserNotifications
 import CoreLocation
 import MapKit
 
-enum AppTab: Hashable { case map, items, alerts, settings }
+enum SheetSection: String, CaseIterable, Identifiable {
+    case items, alerts, me
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .items: "Objekte"
+        case .alerts: "Mitteilungen"
+        case .me: "Ich"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .items: "circle.grid.2x2.fill"
+        case .alerts: "bell.fill"
+        case .me: "person.crop.circle.fill"
+        }
+    }
+}
 struct DeviceRoute: Hashable { let id: String }
+
+enum CircleMode: String, CaseIterable, Identifiable {
+    case off, selected, all
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: "Aus"
+        case .selected: "Auswahl"
+        case .all: "Alle"
+        }
+    }
+}
+
+extension PresentationDetent {
+    static let peek = PresentationDetent.height(150)
+}
 
 @MainActor
 @Observable
@@ -30,12 +63,28 @@ final class AppModel {
     var history: [String: [Report]] = [:]
     var addresses: [String: String] = [:]
 
-    // UI
-    var tab: AppTab = .map
-    var mapPath: [DeviceRoute] = []
-    var itemsPath: [DeviceRoute] = []
-    var alertsPath: [DeviceRoute] = []
+    // UI (Sheet wie in „Wo ist?“)
+    var section: SheetSection = .items
+    var sheetPath: [DeviceRoute] = [] {
+        didSet { if sheetPath.isEmpty { clearFocus() } }
+    }
+    var detent: PresentationDetent = .medium
     var isRefreshing = false
+
+    // Karte & Verlauf des fokussierten Objekts
+    var focusedID: String?
+    var historyRange: HistoryRange = .d7
+    var track: [Report] = []
+    var cursor: Int?
+    var circleMode: CircleMode = CircleMode(rawValue: UserDefaults.standard.string(forKey: "circleMode") ?? "") ?? .selected {
+        didSet { UserDefaults.standard.set(circleMode.rawValue, forKey: "circleMode") }
+    }
+    var followCursor = true
+    var cameraRegion: MKCoordinateRegion?
+    var cameraTick = 0
+    var thoroughRefresh: Bool = UserDefaults.standard.object(forKey: "thoroughRefresh") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(thoroughRefresh, forKey: "thoroughRefresh") }
+    }
     var toast: String?
     var lastError: String?
     var inAppNotifications: Bool = UserDefaults.standard.object(forKey: "inAppNotifications") as? Bool ?? true {
@@ -116,7 +165,7 @@ final class AppModel {
         api = nil
         isConnected = false
         devices = []; status = nil; settings = nil; me = nil; notifications = []; history = [:]
-        mapPath = []; itemsPath = []; alertsPath = []
+        sheetPath = []
     }
 
     // MARK: Laden
@@ -171,22 +220,28 @@ final class AppModel {
 
     // MARK: Aktionen
 
+    /// Aktualisieren: standardmäßig gründlich (Schnell-Abruf + 24 h + 7 Tage in einer gebündelten Abfrage).
     @discardableResult
-    func refresh(deviceID: String? = nil, full: Bool = false) async -> RefreshResult? {
+    func refresh(deviceID: String? = nil, full: Bool? = nil) async -> RefreshResult? {
         guard let api else { return nil }
+        guard !isRefreshing else { return nil }
+        Haptics.soft()
         isRefreshing = true
         defer { isRefreshing = false }
-        var body: [String: Any] = ["wait": true, "full": full, "timeout": 90]
+        var body: [String: Any] = ["wait": true, "full": full ?? thoroughRefresh, "timeout": 110]
         if let deviceID { body["device_id"] = deviceID }
         do {
-            let r: RefreshResult = try await api.send("POST", "/api/refresh", json: body, timeout: 100)
+            let r: RefreshResult = try await api.send("POST", "/api/refresh", json: body, timeout: 120)
             await reloadDevices()
             await reloadStatus()
-            if let e = r.error { showToast("⚠️ \(e)") }
-            else if r.timeout == true { showToast("Abruf läuft im Hintergrund weiter …") }
-            else { showToast((r.new ?? 0) > 0 ? "✅ \(r.new ?? 0) neue Standorte" : "Keine neuen Standorte") }
+            if let id = focusedID { await reloadTrack(id, keepCursor: true) }
+            if let e = r.error { Haptics.warning(); showToast("⚠️ \(e)") }
+            else if r.timeout == true { Haptics.light(); showToast("Abruf läuft im Hintergrund weiter …") }
+            else if (r.new ?? 0) > 0 { Haptics.success(); showToast("\(r.new ?? 0) neue Standorte") }
+            else { Haptics.light(); showToast("Alles aktuell – keine neuen Standorte") }
             return r
         } catch {
+            Haptics.warning()
             showToast("⚠️ \(error.localizedDescription)")
             return nil
         }
@@ -228,8 +283,86 @@ final class AppModel {
     }
 
     func openDevice(_ id: String) {
-        tab = .items
-        itemsPath = [DeviceRoute(id: id)]
+        Haptics.selection()
+        section = .items
+        if sheetPath.last?.id != id { sheetPath = [DeviceRoute(id: id)] }
+        if detent == .peek { detent = .medium }
+    }
+
+    // MARK: Fokus, Verlauf & Kamera
+
+    func focus(_ id: String) async {
+        if focusedID != id {
+            focusedID = id
+            track = []
+            cursor = nil
+        }
+        if let r = device(id)?.last { show(center: r.coordinate, meters: 900) }
+        await reloadTrack(id, keepCursor: false)
+        fitTrack()
+    }
+
+    func clearFocus() {
+        focusedID = nil
+        track = []
+        cursor = nil
+    }
+
+    func reloadTrack(_ id: String, keepCursor: Bool) async {
+        let since: Double? = historyRange == .all ? nil : Date().timeIntervalSince1970 - historyRange.rawValue
+        guard let r = try? await loadHistory(id, since: since), focusedID == id else { return }
+        let wasAtEnd = cursor == nil || cursor == track.count - 1
+        track = r
+        if !keepCursor || wasAtEnd { cursor = r.isEmpty ? nil : r.count - 1 }
+        else if let c = cursor, c >= r.count { cursor = r.count - 1 }
+    }
+
+    var cursorReport: Report? {
+        guard let c = cursor, track.indices.contains(c) else { return nil }
+        return track[c]
+    }
+
+    func select(reportID: Int) {
+        if let i = track.firstIndex(where: { $0.id == reportID }) {
+            Haptics.selection()
+            cursor = i
+        }
+    }
+
+    /// Verschiebt die Kamera so, dass der Punkt oberhalb des Sheets sichtbar ist.
+    func show(center: CLLocationCoordinate2D, meters: Double) {
+        let r = MKCoordinateRegion(center: center, latitudinalMeters: meters, longitudinalMeters: meters)
+        show(region: r)
+    }
+
+    func show(region r: MKCoordinateRegion) {
+        var r = r
+        let shift: Double = switch detent {
+        case .large: 0.0
+        case .peek: 0.12
+        default: 0.32
+        }
+        let grow = 1 + shift * 1.6
+        r.span.latitudeDelta *= grow
+        r.span.longitudeDelta *= grow
+        r.center.latitude -= r.span.latitudeDelta * shift * 0.75
+        cameraRegion = r
+        cameraTick += 1
+    }
+
+    func fitTrack() {
+        let coords = track.map(\.coordinate)
+        if let r = region(fitting: coords, padding: 1.35, minSpan: 0.006) { show(region: r) }
+    }
+
+    func fitAll() {
+        let coords = devices.compactMap(\.last).map(\.coordinate)
+        if let r = region(fitting: coords, padding: 1.6) { show(region: r) }
+    }
+
+    func distanceFromUser(_ r: Report) -> String? {
+        guard let loc = LocationPermission.manager.location else { return nil }
+        return formatDistance(loc.distance(from: CLLocation(latitude: r.lat, longitude: r.lon)))
     }
 
     func handle(url: URL) {
@@ -297,17 +430,29 @@ final class AppModel {
         case "device":
             if let d = try? api.decoder.decode(Device.self, from: data) { replace(d) }
         case "reports":
-            if let r = try? api.decoder.decode(ReportsEvent.self, from: data), var h = history[r.deviceId] {
-                h.append(contentsOf: r.reports)
-                h.sort { $0.ts < $1.ts }
-                history[r.deviceId] = h
+            if let r = try? api.decoder.decode(ReportsEvent.self, from: data) {
+                if var h = history[r.deviceId] {
+                    h.append(contentsOf: r.reports)
+                    h.sort { $0.ts < $1.ts }
+                    history[r.deviceId] = h
+                }
+                if r.deviceId == focusedID {
+                    let atEnd = cursor == nil || cursor == track.count - 1
+                    let since = historyRange == .all ? 0 : Date().timeIntervalSince1970 - historyRange.rawValue
+                    var t = track + r.reports.filter { $0.ts >= since }
+                    t.sort { $0.ts < $1.ts }
+                    track = t
+                    if atEnd { cursor = t.isEmpty ? nil : t.count - 1 }
+                    Haptics.light()
+                }
             }
         case "settings":
             if let s = try? api.decoder.decode(ServerSettings.self, from: data) { settings = s }
         case "notification":
             if let n = try? api.decoder.decode(ServerNotification.self, from: data) {
                 notifications.insert(n, at: 0)
-                if tab != .alerts { unreadAlerts += 1 }
+                if section != .alerts { unreadAlerts += 1 }
+                if n.level == "critical" { Haptics.warning() }
                 if inAppNotifications { postLocal(n) }
             }
         default: break

@@ -1,219 +1,234 @@
 import SwiftUI
 import MapKit
 
+enum MapSel: Hashable {
+    case device(String)
+    case report(Int)
+}
+
 struct Pin: Identifiable {
     let device: Device
     let report: Report
     var id: String { device.id }
 }
 
+/// Vollbild-Karte mit dauerhaftem Sheet – Aufbau wie Apples „Wo ist?“.
 struct MapScreen: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openURL) private var openURL
     @Namespace private var mapScope
 
     @State private var position: MapCameraPosition = .automatic
-    @State private var selection: String?
-    @State private var style: MapStyleChoice = .standard
-    @State private var track: [Report] = []
+    @State private var style: MapStyleChoice = MapStyleChoice(rawValue: UserDefaults.standard.string(forKey: "mapStyle") ?? "") ?? .standard
     @State private var fitted = false
-    @State private var address: String?
+    @State private var showStyleMenu = false
 
     private var pins: [Pin] {
         model.devices.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
     }
-    private var selected: Device? { selection.flatMap { model.device($0) } }
+
+    private var focused: Device? { model.focusedID.flatMap { model.device($0) } }
+
+    /// Für die Karte ausgedünnte Verlaufspunkte (max. ~600), Auswahl bleibt immer enthalten.
+    private var dots: [(index: Int, report: Report)] {
+        let t = model.track
+        guard !t.isEmpty else { return [] }
+        let step = max(1, t.count / 600)
+        var idx = Set(stride(from: 0, to: t.count, by: step))
+        idx.insert(t.count - 1)
+        if let c = model.cursor { idx.insert(c) }
+        return idx.sorted().map { ($0, t[$0]) }
+    }
 
     var body: some View {
-        Map(position: $position, selection: $selection, scope: mapScope) {
+        @Bindable var model = model
+        mapView
+            .mapStyle(style.style)
+            .mapControls {
+                MapCompass(scope: mapScope)
+                MapScaleView(scope: mapScope)
+            }
+            .mapScope(mapScope)
+            .ignoresSafeArea()
+            .overlay(alignment: .topLeading) {
+                StatusPill().padding(.leading, 16).padding(.top, 4)
+            }
+            .overlay(alignment: .topTrailing) { controls.padding(.trailing, 14).padding(.top, 4) }
+            .sheet(isPresented: .constant(true)) {
+                FindSheet()
+                    .environment(model)
+                    .presentationDetents([.peek, .medium, .large], selection: $model.detent)
+                    .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+                    .presentationDragIndicator(.visible)
+                    .interactiveDismissDisabled()
+                    .presentationContentInteraction(.scrolls)
+            }
+            .onAppear {
+                LocationPermission.request()
+                fitIfNeeded()
+            }
+            .onChange(of: model.devices) { _, _ in fitIfNeeded() }
+            .onChange(of: model.cameraTick) { _, _ in
+                if let r = model.cameraRegion {
+                    withAnimation(.smooth(duration: 0.75)) { position = .region(r) }
+                }
+            }
+            .onChange(of: model.cursor) { _, _ in
+                guard model.followCursor, let r = model.cursorReport else { return }
+                model.show(center: r.coordinate, meters: max(500, Double(r.accuracy ?? 0) * 8))
+            }
+            .onChange(of: model.detent) { _, _ in Haptics.light() }
+            .sensoryFeedback(.impact(weight: .light), trigger: model.isRefreshing)
+    }
+
+    // MARK: Karte
+
+    private var mapView: some View {
+        let selection = Binding<MapSel?>(
+            get: { nil },
+            set: { sel in
+                switch sel {
+                case .device(let id): model.openDevice(id)
+                case .report(let rid): model.select(reportID: rid)
+                case nil: break
+                }
+            }
+        )
+        return Map(position: $position, selection: selection, scope: mapScope) {
             UserAnnotation()
+
             ForEach(model.settings?.zones ?? []) { z in
                 MapCircle(center: z.coordinate, radius: z.radius)
-                    .foregroundStyle(.blue.opacity(0.08))
-                    .stroke(.blue.opacity(0.5), lineWidth: 1)
+                    .foregroundStyle(.blue.opacity(0.07))
+                    .stroke(.blue.opacity(0.45), lineWidth: 1)
             }
-            if let d = selected, track.count > 1 {
-                MapPolyline(coordinates: track.map(\.coordinate))
-                    .stroke(d.tint.opacity(0.8), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+
+            if let d = focused {
+                // Wache-Radius
+                if d.isGuarded, let gl = d.alerts.guardMode.lat, let gn = d.alerts.guardMode.lon {
+                    MapCircle(center: .init(latitude: gl, longitude: gn), radius: d.alerts.guardMode.radiusM)
+                        .foregroundStyle(.orange.opacity(0.08))
+                        .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                }
+                // Genauigkeitskreise
+                if model.circleMode == .all {
+                    ForEach(dots, id: \.report.id) { item in
+                        MapCircle(center: item.report.coordinate, radius: CLLocationDistance(max(item.report.accuracy ?? 5, 5)))
+                            .foregroundStyle(d.tint.opacity(0.06))
+                            .stroke(d.tint.opacity(0.35), lineWidth: 0.8)
+                    }
+                }
+                if model.circleMode != .off, let r = model.cursorReport {
+                    MapCircle(center: r.coordinate, radius: CLLocationDistance(max(r.accuracy ?? 5, 5)))
+                        .foregroundStyle(d.tint.opacity(0.18))
+                        .stroke(d.tint, lineWidth: 1.5)
+                }
+                // Spur
+                if model.track.count > 1 {
+                    MapPolyline(coordinates: model.track.map(\.coordinate))
+                        .stroke(d.tint.opacity(0.7), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                }
+                // Punkte (antippbar)
+                ForEach(dots, id: \.report.id) { item in
+                    Annotation("", coordinate: item.report.coordinate, anchor: .center) {
+                        HistoryDot(color: d.tint,
+                                   progress: Double(item.index) / Double(max(model.track.count - 1, 1)),
+                                   selected: item.index == model.cursor)
+                    }
+                    .tag(MapSel.report(item.report.id))
+                    .annotationTitles(.hidden)
+                }
             }
+
+            // Objekte (AirTag-Pins)
             ForEach(pins) { p in
-                MapCircle(center: p.report.coordinate, radius: CLLocationDistance(max(p.report.accuracy ?? 5, 5)))
-                    .foregroundStyle(p.device.tint.opacity(0.14))
-                    .stroke(p.device.tint.opacity(0.5), lineWidth: 1)
-                Annotation(p.device.name, coordinate: p.report.coordinate, anchor: .center) {
-                    DeviceMarker(device: p.device, selected: selection == p.device.id)
+                if model.circleMode != .off && p.device.id != model.focusedID {
+                    MapCircle(center: p.report.coordinate, radius: CLLocationDistance(max(p.report.accuracy ?? 5, 5)))
+                        .foregroundStyle(p.device.tint.opacity(0.1))
+                        .stroke(p.device.tint.opacity(0.4), lineWidth: 1)
                 }
-                .tag(p.device.id)
-            }
-        }
-        .mapStyle(style.style)
-        .mapControls {
-            MapCompass(scope: mapScope)
-            MapScaleView(scope: mapScope)
-        }
-        .mapScope(mapScope)
-        .ignoresSafeArea(edges: .top)
-        .overlay(alignment: .topLeading) {
-            StatusPill().padding(.leading, 16).padding(.top, 8)
-        }
-        .overlay(alignment: .topTrailing) { controls.padding(.trailing, 16).padding(.top, 8) }
-        .safeAreaInset(edge: .bottom) { bottom.padding(.horizontal, 12).padding(.bottom, 6) }
-        .toolbar(.hidden, for: .navigationBar)
-        .onAppear {
-            LocationPermission.request()
-            fitIfNeeded()
-        }
-        .onChange(of: model.devices) { _, _ in
-            fitIfNeeded()
-            if let id = selection { track = model.history[id] ?? track }
-        }
-        .onChange(of: selection) { _, id in
-            address = nil
-            track = []
-            guard let id, let d = model.device(id) else { return }
-            if let r = d.last {
-                withAnimation(.smooth(duration: 0.8)) {
-                    position = .region(MKCoordinateRegion(center: r.coordinate, latitudinalMeters: 900, longitudinalMeters: 900))
+                Annotation(p.device.name, coordinate: p.report.coordinate, anchor: .bottom) {
+                    AirTagPin(device: p.device,
+                              selected: p.device.id == model.focusedID,
+                              stale: findMyTime(p.report.date).old)
                 }
-            }
-            Task {
-                track = (try? await model.loadHistory(id, since: Date().timeIntervalSince1970 - 86400)) ?? []
-                if let r = d.last { address = await model.address(for: r) }
+                .tag(MapSel.device(p.device.id))
+                .annotationTitles(p.device.id == model.focusedID ? .visible : .automatic)
             }
         }
-        .sensoryFeedback(.selection, trigger: selection)
     }
+
+    // MARK: Bedienelemente (oben rechts, wie „Wo ist?“)
 
     private var controls: some View {
-        GlassEffectContainer(spacing: 8) {
-            VStack(spacing: 8) {
-                Button {
-                    Task { await model.refresh() }
+        VStack(spacing: 10) {
+            VStack(spacing: 0) {
+                Menu {
+                    Picker("Karte", selection: $style) {
+                        ForEach(MapStyleChoice.allCases) { s in
+                            Label(s.label, systemImage: s.icon).tag(s)
+                        }
+                    }
+                    Picker("Genauigkeitskreise", selection: Binding(get: { model.circleMode }, set: { model.circleMode = $0 })) {
+                        ForEach(CircleMode.allCases) { Text("Kreise: \($0.label)").tag($0) }
+                    }
                 } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .symbolEffect(.rotate, isActive: model.isRefreshing)
-                        .frame(width: 44, height: 44)
+                    Image(systemName: style == .standard ? "map" : "map.fill")
+                        .frame(width: 46, height: 44)
+                        .contentShape(Rectangle())
                 }
-                .glassEffect(.regular.interactive(), in: .circle)
-                Button { fitAll() } label: {
-                    Image(systemName: "scope").frame(width: 44, height: 44)
-                }
-                .glassEffect(.regular.interactive(), in: .circle)
-                Button { withAnimation { style = style.next } } label: {
-                    Image(systemName: style.icon).frame(width: 44, height: 44)
-                }
-                .glassEffect(.regular.interactive(), in: .circle)
-                MapUserLocationButton(scope: mapScope)
-                    .frame(width: 44, height: 44)
-                    .glassEffect(.regular.interactive(), in: .circle)
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 17, weight: .semibold))
-        }
-    }
-
-    @ViewBuilder
-    private var bottom: some View {
-        if let d = selected {
-            selectedCard(d)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if !model.devices.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                GlassEffectContainer(spacing: 10) {
-                    HStack(spacing: 10) {
-                        ForEach(model.devices) { d in
-                            Button { selection = d.id } label: {
-                                HStack(spacing: 8) {
-                                    Text(d.symbol)
-                                    VStack(alignment: .leading, spacing: 0) {
-                                        Text(d.name).font(.subheadline.bold()).lineLimit(1)
-                                        Text(d.last.map { $0.date.relativeDE } ?? "kein Standort")
-                                            .font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                }
-                                .padding(.horizontal, 14).padding(.vertical, 10)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.tint(d.lost.enabled ? .red.opacity(0.35) : d.tint.opacity(0.18)).interactive(),
-                                         in: .capsule)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                }
-            }
-        } else {
-            Label("Noch keine Objekte – importiere Schlüssel in den Einstellungen.", systemImage: "tray")
-                .font(.footnote).padding(14)
-                .glassEffect(.regular, in: .capsule)
-        }
-    }
-
-    private func selectedCard(_ d: Device) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                EmojiBadge(device: d, size: 50)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text(d.name).font(.title3.bold()).lineLimit(1)
-                        if d.lost.enabled {
-                            Text("VERLOREN").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(.red, in: .capsule).foregroundStyle(.white)
-                        }
-                    }
-                    if let r = d.last {
-                        Text("\(r.date.relativeDE) · ±\(r.accuracy ?? 0) m")
-                            .font(.subheadline).foregroundStyle(.secondary)
-                        if let address { Text(address).font(.footnote).foregroundStyle(.secondary).lineLimit(1) }
+                Divider().frame(width: 28)
+                Button {
+                    Haptics.light()
+                    if let c = LocationPermission.manager.location?.coordinate {
+                        model.show(center: c, meters: 1200)
                     } else {
-                        Text("Noch kein Standort").font(.subheadline).foregroundStyle(.secondary)
+                        LocationPermission.request()
                     }
+                } label: {
+                    Image(systemName: "location")
+                        .frame(width: 46, height: 44)
+                        .contentShape(Rectangle())
                 }
-                Spacer()
-                BatteryView(level: d.battery)
-                Button { withAnimation { selection = nil } } label: {
-                    Image(systemName: "xmark").font(.footnote.bold()).frame(width: 30, height: 30)
+                Divider().frame(width: 28)
+                Button {
+                    Haptics.light()
+                    if model.focusedID != nil, !model.track.isEmpty { model.fitTrack() } else { model.fitAll() }
+                } label: {
+                    Image(systemName: "scope")
+                        .frame(width: 46, height: 44)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .circle)
             }
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await model.refresh(deviceID: d.id) }
-                    } label: {
-                        Label("Orten", systemImage: "location.magnifyingglass").frame(maxWidth: .infinity)
+            .glassEffect(.regular.interactive(), in: .capsule)
+
+            Button {
+                Task { await model.refresh(deviceID: model.focusedID) }
+            } label: {
+                Group {
+                    if model.isRefreshing {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "arrow.clockwise")
                     }
-                    .buttonStyle(.glass)
-                    Button {
-                        if let r = d.last, let u = appleMapsURL(r, name: d.name, directions: true) { openURL(u) }
-                    } label: {
-                        Label("Route", systemImage: "car.fill").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glass)
-                    .disabled(d.last == nil)
-                    NavigationLink(value: DeviceRoute(id: d.id)) {
-                        Label("Verlauf", systemImage: "clock.arrow.circlepath").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glassProminent)
                 }
-                .labelStyle(.titleAndIcon)
-                .font(.subheadline.weight(.semibold))
+                .frame(width: 46, height: 46)
+                .contentShape(Circle())
             }
+            .glassEffect(.regular.interactive(), in: .circle)
+            .disabled(model.isRefreshing)
         }
-        .padding(16)
-        .glassEffect(.regular, in: .rect(cornerRadius: 30))
+        .buttonStyle(.plain)
+        .font(.system(size: 18, weight: .medium))
+        .foregroundStyle(.primary)
+        .onChange(of: style) { _, s in
+            Haptics.selection()
+            UserDefaults.standard.set(s.rawValue, forKey: "mapStyle")
+        }
     }
 
     private func fitIfNeeded() {
         guard !fitted, !pins.isEmpty else { return }
         fitted = true
-        fitAll()
-    }
-
-    private func fitAll() {
-        selection = nil
-        if let r = region(fitting: pins.map(\.report.coordinate), padding: 1.8) {
-            withAnimation(.smooth(duration: 0.8)) { position = .region(r) }
-        }
+        model.fitAll()
     }
 }

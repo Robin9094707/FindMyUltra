@@ -52,11 +52,18 @@ struct SettingsView: View {
                 zonesSection
             }
 
-            Section("App") {
+            Section {
+                Toggle("Gründlich aktualisieren", isOn: $model.thoroughRefresh)
+                    .onChange(of: model.thoroughRefresh) { _, _ in Haptics.light() }
                 Toggle("Mitteilungen in der App", isOn: $model.inAppNotifications)
+                    .onChange(of: model.inAppNotifications) { _, _ in Haptics.light() }
                 NavigationLink { SecurityView() } label: {
                     Label("Sicherheit (Passwort, 2FA, Passkeys)", systemImage: "lock.shield")
                 }
+            } header: {
+                Text("App")
+            } footer: {
+                Text("„Gründlich“: Jedes Aktualisieren startet Schnell-Abruf, 24-h- und 7-Tage-Scan gleichzeitig (gebündelt in einer Abfrage) – so landen auch nachgelieferte Standorte sofort im Verlauf.")
             }
 
             Section {
@@ -65,17 +72,37 @@ struct SettingsView: View {
                 Text("FindMy Ultra \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") · Server \(model.status?.version ?? "–")")
             }
         }
-        .navigationTitle("Einstellungen")
-        .toolbar {
+        .scrollContentBackground(.hidden)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack {
+                Text("Ich").font(.largeTitle.bold())
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+        }
+        .safeAreaInset(edge: .bottom) {
             if dirty {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Sichern") { Task { await save() } }.disabled(saving)
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Button("Verwerfen") { Haptics.light(); draft = model.settings }
+                            .buttonStyle(.glass)
+                        Button {
+                            Task { await save() }
+                        } label: {
+                            Text(saving ? "Sichere …" : "Änderungen sichern").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .disabled(saving)
+                    }
+                    .controlSize(.large)
                 }
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Verwerfen") { draft = model.settings }
-                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .animation(.spring(duration: 0.3), value: dirty)
         .onAppear { if draft == nil { draft = model.settings } }
         .onChange(of: model.settings) { old, new in if draft == nil || draft == old { draft = new } }
         .sheet(isPresented: $importing) {
@@ -243,8 +270,10 @@ struct SettingsView: View {
         do {
             try await model.saveSettings(d)
             draft = model.settings
-            model.showToast("✅ Gesichert")
+            Haptics.success()
+            model.showToast("Gesichert")
         } catch {
+            Haptics.warning()
             model.showToast("⚠️ \(error.localizedDescription)")
         }
     }
@@ -268,18 +297,8 @@ struct SettingsView: View {
     }
 
     private func upload(_ files: [(name: String, data: Data)]) async {
-        guard let api = model.api else { return }
         importResult = "Importiere \(files.count) Datei(en) …"
-        do {
-            let r = try await api.upload(files: files)
-            let added = (r.added ?? []).map { "✅ \($0.name)\($0.new ? "" : " (aktualisiert)")" }
-            let failed = (r.errors ?? []).map { "❌ \($0.file): \($0.error)" }
-            importResult = (added + failed).joined(separator: "\n")
-            await model.reloadDevices()
-            if !added.isEmpty { model.showToast("✅ \(added.count) Objekt(e) importiert") }
-        } catch {
-            importResult = "❌ \(error.localizedDescription)"
-        }
+        importResult = await KeyImporter.upload(files, model: model)
     }
 
     private func handleImport(_ result: Result<[URL], Error>) async {

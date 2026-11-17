@@ -41,7 +41,7 @@ from __future__ import annotations
 # ════════════════════════════════════════════════════════════════════════════
 #  ⚙️  HIER EINSTELLEN
 # ════════════════════════════════════════════════════════════════════════════
-PORT = 8787          # Port, auf dem der Server läuft (in der App: <IP>:<PORT>)
+PORT = 5070          # Port, auf dem der Server läuft (in der App: <IP>:<PORT>)
 HOST = "0.0.0.0"     # "0.0.0.0" = im ganzen Netzwerk erreichbar, "127.0.0.1" = nur lokal
 # (Kommandozeile --port/--host oder FMU_PORT/FMU_HOST überschreiben diese Werte)
 
@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1439,8 +1439,9 @@ class State:
             for t in self.registry.tracked.values():
                 if device_ids is None or t.id in device_ids:
                     t.last_quick = 0.0
-                    if full:
+                    if full:  # gründlich: Schnell + 24 h + 7 Tage in EINER gebündelten Abfrage
                         t.last_full = 0.0
+                        t.last_day = 0.0
         fut = asyncio.get_running_loop().create_future()
         self.waiters.append(fut)
         self.poll_event.set()
@@ -2070,7 +2071,7 @@ def build_app(st: State) -> web.Application:
     async def refresh(req: web.Request) -> web.Response:
         b = await req.json() if req.can_read_body else {}
         ids = b.get("device_ids") or ([b["device_id"]] if b.get("device_id") else None)
-        fut = st.wake(ids, full=bool(b.get("full")))
+        fut = st.wake(ids, full=bool(b.get("full", True)))
         if not b.get("wait", True):
             return web.json_response({"ok": True, "queued": True})
         try:
@@ -2270,7 +2271,7 @@ input,select{font:inherit;color:var(--fg);background:rgba(255,255,255,.07);borde
 <div class="modal" id="setup"><div class="card glass">
   <h2>Einrichtung</h2>
   <div id="applebox"></div>
-  <div class="sec"><label>Schlüssel importieren (.json / .plist)</label><input type="file" id="keyfiles" multiple accept=".json,.plist,application/json">
+  <div class="sec"><label>Schlüssel importieren (.json / .plist)</label><input type="file" id="keyfiles" multiple>
   <div class="row2"><button onclick="importKeys()">Importieren</button></div><div class="err" id="ierr"></div></div>
   <div class="sec"><label>Sicherheit</label><div class="row2"><button onclick="registerPasskey()">🔑 Passkey hinzufügen</button><button onclick="changePw()">Passwort ändern</button><button onclick="logoutWeb()">Abmelden</button></div><div class="err" id="serr"></div></div>
   <div class="sec small">Export: <a href="#" onclick="exp('gpx')">GPX</a> · <a href="#" onclick="exp('csv')">CSV</a> · <a href="#" onclick="exp('json')">JSON</a>. Weitere Einstellungen (Alarme, Bark, Zonen, 2FA) in der iOS-App.</div>

@@ -1,48 +1,23 @@
 import SwiftUI
 import MapKit
 
-enum HistoryRange: Double, CaseIterable, Identifiable {
-    case h1 = 3600, h6 = 21600, h24 = 86400, d3 = 259200, d7 = 604800, d30 = 2592000, all = 0
-    var id: Double { rawValue }
-    var label: String {
-        switch self {
-        case .h1: "1 h"
-        case .h6: "6 h"
-        case .h24: "24 h"
-        case .d3: "3 T"
-        case .d7: "7 T"
-        case .d30: "30 T"
-        case .all: "Alle"
-        }
-    }
-}
-
+/// Objekt-Karte im Sheet (wie in „Wo ist?“). Die Hauptkarte zeigt dazu Spur, Punkte & Genauigkeitskreise.
 struct DeviceDetailView: View {
     let deviceID: String
     @Environment(AppModel.self) private var model
     @Environment(\.openURL) private var openURL
-    @Environment(\.dismiss) private var dismiss
 
-    @State private var range: HistoryRange = .d7
-    @State private var reports: [Report] = []
-    @State private var cursor: Double = 0
     @State private var playing = false
-    @State private var follow = true
-    @State private var position: MapCameraPosition = .automatic
-    @State private var loading = false
+    @State private var address: String?
     @State private var cursorAddress: String?
     @State private var sheet: SheetKind?
     @State private var confirmDelete = false
     @State private var showAllRows = false
     @State private var gpxURL: URL?
-    @State private var style: MapStyleChoice = .standard
 
     enum SheetKind: String, Identifiable { case lost, alerts, edit; var id: String { rawValue } }
 
     private var device: Device? { model.device(deviceID) }
-    private var current: Report? {
-        reports.isEmpty ? nil : reports[min(max(Int(cursor.rounded()), 0), reports.count - 1)]
-    }
 
     var body: some View {
         Group {
@@ -52,40 +27,35 @@ struct DeviceDetailView: View {
                 ContentUnavailableView("Objekt nicht gefunden", systemImage: "questionmark.circle")
             }
         }
-        .navigationTitle(device?.name ?? "")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbar }
-        .task(id: range) { await load(fit: true) }
-        .onChange(of: model.history[deviceID]) { _, h in
-            guard let h, !playing else { return }
-            let atEnd = Int(cursor.rounded()) >= reports.count - 1
-            let since = range == .all ? 0 : Date().timeIntervalSince1970 - range.rawValue
-            reports = h.filter { $0.ts >= since }
-            if atEnd { cursor = Double(max(reports.count - 1, 0)) }
-            writeGPX()
-        }
-        .onChange(of: cursor) { _, _ in
-            guard follow, let r = current else { return }
-            withAnimation(.smooth(duration: playing ? 0.3 : 0.5)) {
-                position = .camera(MapCamera(centerCoordinate: r.coordinate, distance: 1400))
+        .toolbar(.hidden, for: .navigationBar)
+        .task(id: deviceID) { await model.focus(deviceID) }
+        .onChange(of: model.historyRange) { _, _ in
+            Task {
+                await model.reloadTrack(deviceID, keepCursor: false)
+                model.fitTrack()
             }
         }
-        .task(id: current?.id) {
+        .task(id: device?.last?.id) {
+            if let r = device?.last { address = await model.address(for: r) }
+        }
+        .task(id: model.cursorReport?.id) {
             cursorAddress = nil
-            if let r = current {
-                try? await Task.sleep(for: .milliseconds(350))
-                if !Task.isCancelled { cursorAddress = await model.address(for: r) }
-            }
+            guard let r = model.cursorReport else { return }
+            try? await Task.sleep(for: .milliseconds(300))
+            if !Task.isCancelled { cursorAddress = await model.address(for: r) }
         }
         .task(id: playing) {
             guard playing else { return }
-            if Int(cursor) >= reports.count - 1 { cursor = 0 }
+            if (model.cursor ?? 0) >= model.track.count - 1 { model.cursor = 0 }
             while playing && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(420))
-                if Int(cursor) >= reports.count - 1 { playing = false; break }
-                cursor += 1
+                try? await Task.sleep(for: .milliseconds(450))
+                let c = model.cursor ?? 0
+                if c >= model.track.count - 1 { playing = false; Haptics.success(); break }
+                model.cursor = c + 1
+                Haptics.selection()
             }
         }
+        .onChange(of: model.track) { _, _ in writeGPX() }
         .sheet(item: $sheet) { s in
             if let d = device {
                 NavigationStack {
@@ -95,14 +65,15 @@ struct DeviceDetailView: View {
                     case .edit: EditDeviceView(device: d)
                     }
                 }
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.large])
             }
         }
         .confirmationDialog("Objekt entfernen?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Entfernen (inkl. Verlauf)", role: .destructive) {
                 Task {
                     try? await model.deleteDevice(deviceID)
-                    dismiss()
+                    Haptics.success()
+                    model.sheetPath = []
                 }
             }
         } message: {
@@ -114,220 +85,283 @@ struct DeviceDetailView: View {
 
     private func content(_ d: Device) -> some View {
         ScrollView {
-            VStack(spacing: 16) {
-                mapCard(d)
-                rangePicker
+            VStack(alignment: .leading, spacing: 16) {
+                header(d)
+                if d.lost.enabled { lostBanner(d) }
                 actions(d)
-                if let r = current { pointInfo(r, d) }
-                infoSection(d)
-                historyList(d)
+                historyCard(d)
+                if let r = model.cursorReport { pointCard(r, d) }
+                infoCard(d)
+                pointList(d)
+                Button(role: .destructive) { confirmDelete = true } label: {
+                    Label("Objekt entfernen", systemImage: "trash").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .tint(.red)
+                .padding(.top, 4)
             }
             .padding(.horizontal, 16)
-            .padding(.bottom, 30)
+            .padding(.top, 16)
+            .padding(.bottom, 40)
         }
-        .refreshable { _ = await model.refresh(deviceID: d.id); await load(fit: false) }
+        .refreshable { await model.refresh(deviceID: d.id) }
     }
 
-    private func mapCard(_ d: Device) -> some View {
-        let coords = reports.map(\.coordinate)
-        let step = max(1, reports.count / 300)
-        let dots = Array(stride(from: 0, to: reports.count, by: step)).map { reports[$0] }
-        return Map(position: $position) {
-            if coords.count > 1 {
-                MapPolyline(coordinates: coords)
-                    .stroke(d.tint.opacity(0.85), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
-            }
-            ForEach(Array(dots.enumerated()), id: \.element.id) { i, r in
-                Annotation("", coordinate: r.coordinate, anchor: .center) {
-                    Circle()
-                        .fill(d.tint.opacity(0.3 + 0.7 * Double(i) / Double(max(dots.count, 1))))
-                        .frame(width: 8, height: 8)
-                        .overlay(Circle().stroke(.white, lineWidth: 1))
-                }
-            }
-            if let r = current {
-                MapCircle(center: r.coordinate, radius: CLLocationDistance(max(r.accuracy ?? 5, 5)))
-                    .foregroundStyle(d.tint.opacity(0.18))
-                    .stroke(d.tint, lineWidth: 1)
-                Annotation(d.name, coordinate: r.coordinate, anchor: .center) {
-                    DeviceMarker(device: d, selected: true)
-                }
-            }
-            if let g = d.alerts.guardMode.lat, let gl = d.alerts.guardMode.lon, d.isGuarded {
-                MapCircle(center: .init(latitude: g, longitude: gl), radius: d.alerts.guardMode.radiusM)
-                    .foregroundStyle(.orange.opacity(0.1))
-                    .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
-            }
-            UserAnnotation()
-        }
-        .mapStyle(style.style)
-        .frame(height: 430)
-        .clipShape(.rect(cornerRadius: 30))
-        .overlay(alignment: .topTrailing) {
-            GlassEffectContainer(spacing: 8) {
-                VStack(spacing: 8) {
-                    Button { fit() } label: { Image(systemName: "scope").frame(width: 40, height: 40) }
-                        .glassEffect(.regular.interactive(), in: .circle)
-                    Button { withAnimation { style = style.next } } label: {
-                        Image(systemName: style.icon).frame(width: 40, height: 40)
+    private func header(_ d: Device) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(d.name).font(.title.bold()).lineLimit(2)
+                if let r = d.last {
+                    let t = findMyTime(r.date)
+                    Text(address ?? String(format: "%.5f, %.5f", r.lat, r.lon))
+                        .font(.body).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(t.text).foregroundStyle(t.old ? Color.red : Color.secondary)
+                        Text("·").foregroundStyle(.secondary)
+                        Text("±\(r.accuracy ?? 0) m").foregroundStyle(.secondary)
+                        if d.battery != nil {
+                            Text("·").foregroundStyle(.secondary)
+                            BatteryView(level: d.battery)
+                        }
                     }
-                    .glassEffect(.regular.interactive(), in: .circle)
-                    Button { follow.toggle() } label: {
-                        Image(systemName: follow ? "location.fill" : "location").frame(width: 40, height: 40)
-                    }
-                    .glassEffect(.regular.interactive(), in: .circle)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(10)
-        }
-        .overlay(alignment: .bottom) { timeline(d).padding(10) }
-        .overlay {
-            if loading { ProgressView().padding().glassEffect(.regular, in: .circle) }
-        }
-    }
-
-    // MARK: Verlaufsleiste
-
-    private func timeline(_ d: Device) -> some View {
-        VStack(spacing: 8) {
-            if reports.count > 1 {
-                densityStrip(d).frame(height: 14)
-            }
-            HStack(spacing: 10) {
-                Button { cursor = max(0, cursor - 1) } label: { Image(systemName: "backward.frame.fill") }
-                    .disabled(cursor <= 0)
-                Button { playing.toggle() } label: {
-                    Image(systemName: playing ? "pause.fill" : "play.fill").frame(width: 22)
-                }
-                .disabled(reports.count < 2)
-                Button { cursor = min(Double(reports.count - 1), cursor + 1) } label: { Image(systemName: "forward.frame.fill") }
-                    .disabled(Int(cursor) >= reports.count - 1)
-                if reports.count > 1 {
-                    Slider(value: $cursor, in: 0...Double(reports.count - 1), step: 1)
-                        .tint(d.tint)
+                    .font(.subheadline)
                 } else {
-                    Spacer()
+                    Text("Noch kein Standort gefunden").foregroundStyle(.secondary)
                 }
+            }
+            Spacer()
+            Menu {
+                Button { sheet = .edit } label: { Label("Bearbeiten", systemImage: "pencil") }
+                Button { sheet = .alerts } label: { Label("Alarme", systemImage: "bell.badge") }
+                Button {
+                    Task { await model.refresh(deviceID: deviceID, full: true) }
+                } label: { Label("7-Tage-Scan", systemImage: "clock.arrow.2.circlepath") }
+                Button {
+                    Haptics.light()
+                    Task { try? await model.patchDevice(deviceID, ["enabled": !d.enabled]) }
+                } label: { Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen", systemImage: d.enabled ? "pause.circle" : "play.circle") }
+                if let gpxURL {
+                    ShareLink(item: gpxURL) { Label("Verlauf exportieren (GPX)", systemImage: "square.and.arrow.up") }
+                }
+            } label: {
+                Image(systemName: "ellipsis").font(.body.weight(.semibold)).frame(width: 40, height: 40)
+            }
+            .glassEffect(.regular.interactive(), in: .circle)
+            Button {
+                Haptics.light()
+                model.sheetPath = []
+            } label: {
+                Image(systemName: "xmark").font(.body.weight(.semibold)).frame(width: 40, height: 40)
             }
             .buttonStyle(.plain)
-            .font(.system(size: 16, weight: .semibold))
-            HStack {
-                if let r = current {
-                    Text(r.date.shortDE).font(.caption.monospacedDigit().bold())
-                    Text("· ±\(r.accuracy ?? 0) m").font(.caption).foregroundStyle(.secondary)
-                    if r.isBatch { badge("BATCH ×\(r.batchSize ?? 1)", .purple) }
-                    if r.isLate { badge("NACHGEREICHT", .orange) }
+            .glassEffect(.regular.interactive(), in: .circle)
+        }
+    }
+
+    private func lostBanner(_ d: Device) -> some View {
+        Button { sheet = .lost } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill").font(.title2).foregroundStyle(.white)
+                    .symbolEffect(.pulse)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Als verloren markiert").font(.headline).foregroundStyle(.white)
+                    Text(d.lost.since.map { "Seit \(Date(timeIntervalSince1970: $0).shortDE) · Abruf alle \(model.settings?.lostPollInterval ?? 20) s" } ?? "")
+                        .font(.subheadline).foregroundStyle(.white.opacity(0.85))
                 }
                 Spacer()
-                Text(reports.isEmpty ? "keine Punkte" : "\(Int(cursor) + 1) / \(reports.count)")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").foregroundStyle(.white.opacity(0.7))
             }
+            .padding(16)
+            .background(.red.gradient, in: .rect(cornerRadius: 22))
         }
-        .padding(14)
-        .glassEffect(.regular, in: .rect(cornerRadius: 22))
-        .sensoryFeedback(.selection, trigger: Int(cursor))
-    }
-
-    private func densityStrip(_ d: Device) -> some View {
-        let first = reports.first?.ts ?? 0
-        let span = max((reports.last?.ts ?? 1) - first, 1)
-        let cur = current?.ts
-        return Canvas { ctx, size in
-            for r in reports {
-                let x = (r.ts - first) / span * size.width
-                ctx.fill(Path(CGRect(x: x, y: 2, width: 1.5, height: size.height - 4)), with: .color(d.tint.opacity(0.55)))
-            }
-            if let cur {
-                let x = (cur - first) / span * size.width
-                ctx.fill(Path(roundedRect: CGRect(x: x - 2, y: 0, width: 4, height: size.height), cornerRadius: 2),
-                         with: .color(.primary))
-            }
-        }
-        // Auf der Leiste tippen/ziehen springt zum nächstgelegenen Zeitpunkt
-        .overlay(GeometryReader { geo in
-            Color.clear.contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                    let t = first + Double(min(max(v.location.x / geo.size.width, 0), 1)) * span
-                    if let i = reports.firstIndex(where: { $0.ts >= t }) { cursor = Double(i) }
-                })
-        })
-    }
-
-    private var rangePicker: some View {
-        Picker("Zeitraum", selection: $range) {
-            ForEach(HistoryRange.allCases) { Text($0.label).tag($0) }
-        }
-        .pickerStyle(.segmented)
+        .buttonStyle(PressableStyle())
     }
 
     // MARK: Aktionen
 
     private func actions(_ d: Device) -> some View {
-        GlassEffectContainer(spacing: 10) {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
-                action("Orten", "location.magnifyingglass", .blue) {
-                    Task { _ = await model.refresh(deviceID: d.id); await load(fit: false) }
-                }
-                action("Route", "car.fill", .green) {
-                    if let r = d.last, let u = appleMapsURL(r, name: d.name, directions: true) { openURL(u) }
-                }
-                action(d.lost.enabled ? "Verloren ✓" : "Verloren", "exclamationmark.triangle.fill",
-                       .red, active: d.lost.enabled) { sheet = .lost }
-                action(d.isGuarded ? "Wache an" : "Wache", "shield.lefthalf.filled", .orange, active: d.isGuarded) {
-                    Task { await toggleGuard(d) }
-                }
-                action("Alarme", "bell.badge.fill", .purple) { sheet = .alerts }
-                if let gpxURL {
-                    ShareLink(item: gpxURL) {
-                        actionLabel("Export", "square.and.arrow.up", .teal, active: false)
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    action("Export", "square.and.arrow.up", .teal) {}
-                        .disabled(true)
-                }
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+            Button {
+                Task { await model.refresh(deviceID: d.id) }
+            } label: {
+                ActionTile(title: model.isRefreshing ? "Suche …" : "Orten",
+                           subtitle: model.thoroughRefresh ? "Gründlich (7 Tage)" : "Schnell", icon: "location.magnifyingglass", color: .blue)
+            }
+            .disabled(model.isRefreshing)
+            Button {
+                Haptics.light()
+                if let r = d.last, let u = appleMapsURL(r, name: d.name, directions: true) { openURL(u) }
+            } label: {
+                ActionTile(title: "Route", subtitle: d.last.flatMap { model.distanceFromUser($0) } ?? "Apple Karten",
+                           icon: "arrow.triangle.turn.up.right.diamond.fill", color: .blue)
+            }
+            .disabled(d.last == nil)
+            Button { Haptics.light(); sheet = .lost } label: {
+                ActionTile(title: "Verloren", subtitle: d.lost.enabled ? "Aktiviert" : "Aus",
+                           icon: "exclamationmark.triangle.fill", color: .red, active: d.lost.enabled)
+            }
+            Button { Task { await toggleGuard(d) } } label: {
+                ActionTile(title: "Wache", subtitle: d.isGuarded ? "Aktiv · \(formatDistance(d.alerts.guardMode.radiusM))" : "Aus",
+                           icon: "lock.shield.fill", color: .orange, active: d.isGuarded)
+            }
+            Button { Haptics.light(); sheet = .alerts } label: {
+                ActionTile(title: "Mitteilungen", subtitle: alertSummary(d), icon: "bell.badge.fill", color: .purple)
+            }
+            Button { Haptics.light(); sheet = .edit } label: {
+                ActionTile(title: "Bearbeiten", subtitle: "Name, Emoji, Verlauf", icon: "pencil", color: .gray)
             }
         }
+        .buttonStyle(PressableStyle())
     }
 
-    private func action(_ title: String, _ icon: String, _ c: Color, active: Bool = false,
-                        _ run: @escaping () -> Void) -> some View {
-        Button(action: run) { actionLabel(title, icon, c, active: active) }
-            .buttonStyle(.plain)
+    private func alertSummary(_ d: Device) -> String {
+        let a = d.alerts
+        let n = [a.movement.enabled, a.zones.enabled, a.newReport.enabled, a.offline.enabled, a.battery.enabled]
+            .filter { $0 }.count + (a.guardMode.enabled ? 1 : 0)
+        return n == 0 ? "Keine aktiv" : "\(n) aktiv"
     }
 
-    private func actionLabel(_ title: String, _ icon: String, _ c: Color, active: Bool) -> some View {
-        VStack(spacing: 6) {
-            Image(systemName: icon).font(.title3).foregroundStyle(active ? .white : c)
-            Text(title).font(.caption.weight(.semibold)).lineLimit(1)
+    // MARK: Verlauf
+
+    private func historyCard(_ d: Device) -> some View {
+        @Bindable var model = model
+        let count = model.track.count
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Standortverlauf", systemImage: "clock.arrow.circlepath").font(.headline)
+                Spacer()
+                Text("\(count) Punkte").font(.subheadline).foregroundStyle(.secondary)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(HistoryRange.allCases) { r in
+                        Button {
+                            Haptics.selection()
+                            model.historyRange = r
+                        } label: {
+                            Text(r.label)
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 14).padding(.vertical, 7)
+                                .background(model.historyRange == r ? d.tint : Color(.tertiarySystemFill), in: .capsule)
+                                .foregroundStyle(model.historyRange == r ? Color.white : Color.primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            if count > 1 {
+                densityStrip(d).frame(height: 22)
+                HStack(spacing: 14) {
+                    Button { step(-1) } label: { Image(systemName: "backward.fill") }
+                        .disabled((model.cursor ?? 0) <= 0)
+                    Button {
+                        Haptics.light()
+                        playing.toggle()
+                    } label: {
+                        Image(systemName: playing ? "pause.fill" : "play.fill")
+                            .font(.title3).frame(width: 44, height: 44)
+                            .background(d.tint, in: .circle).foregroundStyle(.white)
+                    }
+                    Button { step(1) } label: { Image(systemName: "forward.fill") }
+                        .disabled((model.cursor ?? 0) >= count - 1)
+                    Slider(value: Binding(
+                        get: { Double(model.cursor ?? count - 1) },
+                        set: { v in
+                            let i = Int(v.rounded())
+                            if i != model.cursor { model.cursor = i; Haptics.selection() }
+                        }), in: 0...Double(count - 1), step: 1)
+                        .tint(d.tint)
+                }
+                .buttonStyle(.plain)
+                .font(.body.weight(.semibold))
+                if let r = model.cursorReport {
+                    HStack(spacing: 6) {
+                        Text(r.date.shortDE).font(.subheadline.monospacedDigit().bold())
+                        Text("±\(r.accuracy ?? 0) m").font(.subheadline).foregroundStyle(.secondary)
+                        if r.isBatch { badge("BATCH ×\(r.batchSize ?? 1)", .purple) }
+                        if r.isLate { badge("NACHGEREICHT", .orange) }
+                        Spacer()
+                        Text("\((model.cursor ?? 0) + 1)/\(count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+            } else if count == 0 {
+                Text("Keine Standorte in diesem Zeitraum.").font(.subheadline).foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("Genauigkeitskreise").font(.subheadline)
+                Spacer()
+                Picker("Kreise", selection: $model.circleMode) {
+                    ForEach(CircleMode.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 200)
+                .onChange(of: model.circleMode) { _, _ in Haptics.selection() }
+            }
+            Toggle("Karte folgt dem Punkt", isOn: $model.followCursor)
+                .font(.subheadline)
+                .onChange(of: model.followCursor) { _, _ in Haptics.light() }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .glassEffect(active ? .regular.tint(c.opacity(0.7)).interactive() : .regular.interactive(),
-                     in: .rect(cornerRadius: 22))
+        .padding(16)
+        .background(Color(.secondarySystemGroupedBackground).opacity(0.7), in: .rect(cornerRadius: 22))
     }
 
-    // MARK: Infos
+    private func densityStrip(_ d: Device) -> some View {
+        let t = model.track
+        let first = t.first?.ts ?? 0
+        let span = max((t.last?.ts ?? 1) - first, 1)
+        let cur = model.cursorReport?.ts
+        return GeometryReader { geo in
+            Canvas { ctx, size in
+                ctx.fill(Path(roundedRect: CGRect(x: 0, y: size.height / 2 - 1, width: size.width, height: 2), cornerRadius: 1),
+                         with: .color(.secondary.opacity(0.25)))
+                for r in t {
+                    let x = (r.ts - first) / span * size.width
+                    ctx.fill(Path(roundedRect: CGRect(x: x - 1, y: 4, width: 2.5, height: size.height - 8), cornerRadius: 1),
+                             with: .color(d.tint.opacity(0.6)))
+                }
+                if let cur {
+                    let x = (cur - first) / span * size.width
+                    ctx.fill(Path(roundedRect: CGRect(x: x - 3, y: 0, width: 6, height: size.height), cornerRadius: 3),
+                             with: .color(.primary))
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { v in
+                let target = first + Double(min(max(v.location.x / geo.size.width, 0), 1)) * span
+                if let i = t.firstIndex(where: { $0.ts >= target }), i != model.cursor {
+                    model.cursor = i
+                    Haptics.selection()
+                }
+            })
+        }
+    }
 
-    private func pointInfo(_ r: Report, _ d: Device) -> some View {
+    private func step(_ delta: Int) {
+        guard !model.track.isEmpty else { return }
+        let c = (model.cursor ?? model.track.count - 1) + delta
+        model.cursor = min(max(c, 0), model.track.count - 1)
+        Haptics.selection()
+    }
+
+    private func pointCard(_ r: Report, _ d: Device) -> some View {
         GlassSection(title: "Ausgewählter Standort", systemImage: "mappin.circle.fill") {
             if let cursorAddress { Text(cursorAddress).font(.body.weight(.medium)) }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
-                row("Geortet", "\(r.date.shortDE) (\(r.date.relativeDE))")
+                row("Geortet", "\(r.date.shortDE) (\(findMyTime(r.date).text))")
                 row("Empfangen", "\(r.receivedDate.timeDE) · +\(r.delayMinutes) min")
                 row("Genauigkeit", "±\(r.accuracy ?? 0) m")
                 row("Koordinaten", String(format: "%.6f, %.6f", r.lat, r.lon))
                 if r.isBatch { row("Batch", "\(r.batchSize ?? 1) Berichte gleichzeitig") }
-                if r.isLate { row("Hinweis", "nachgereicht (älter als bisher neuester)") }
+                if r.isLate { row("Hinweis", "nachgereicht") }
                 if let b = r.battery { row("Batterie", BatteryLevel.label(b)) }
             }
             .font(.subheadline)
             HStack {
-                Button("In Karten öffnen") { if let u = appleMapsURL(r, name: d.name) { openURL(u) } }
+                Button("In Karten öffnen") { Haptics.light(); if let u = appleMapsURL(r, name: d.name) { openURL(u) } }
                     .buttonStyle(.glass)
                 Button {
                     UIPasteboard.general.string = String(format: "%.6f, %.6f", r.lat, r.lon)
+                    Haptics.success()
                     model.showToast("Koordinaten kopiert")
                 } label: { Image(systemName: "doc.on.doc") }
                 .buttonStyle(.glass)
@@ -335,8 +369,8 @@ struct DeviceDetailView: View {
         }
     }
 
-    private func infoSection(_ d: Device) -> some View {
-        GlassSection(title: "Objekt", systemImage: "info.circle.fill") {
+    private func infoCard(_ d: Device) -> some View {
+        GlassSection(title: "Details", systemImage: "info.circle.fill") {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                 row("Standorte gesamt", "\(d.total)")
                 if let f = d.firstTs { row("Verlauf seit", Date(timeIntervalSince1970: f).shortDE) }
@@ -344,26 +378,29 @@ struct DeviceDetailView: View {
                     ?? "Standard (\(model.settings?.retentionDays ?? 7) Tage)")
                 row("Batterie", BatteryLevel.label(d.battery))
                 if let s = d.serial, !s.isEmpty { row("Seriennummer", s) }
-                row("Abruf", d.enabled ? (d.lost.enabled || d.isGuarded ? "Schnell (\(model.settings?.lostPollInterval ?? 20) s)" : "Normal (\(model.settings?.pollInterval ?? 60) s)") : "pausiert")
+                row("Abruf", d.enabled ? (d.lost.enabled || d.isGuarded
+                                          ? "Schnell (alle \(model.settings?.lostPollInterval ?? 20) s)"
+                                          : "Normal (alle \(model.settings?.pollInterval ?? 60) s)") : "pausiert")
             }
             .font(.subheadline)
         }
     }
 
-    private func historyList(_ d: Device) -> some View {
-        let rows = Array(reports.enumerated().reversed())
-        let shown = showAllRows ? rows : Array(rows.prefix(150))
+    private func pointList(_ d: Device) -> some View {
+        let rows = Array(model.track.enumerated().reversed())
+        let shown = showAllRows ? rows : Array(rows.prefix(120))
         let groups = Dictionary(grouping: shown) { Calendar.current.startOfDay(for: $0.element.date) }
-        return GlassSection(title: "Standortverlauf (\(reports.count))", systemImage: "list.bullet.below.rectangle") {
+        return GlassSection(title: "Alle Punkte", systemImage: "list.bullet") {
             ForEach(groups.keys.sorted(by: >), id: \.self) { day in
                 Text(day.formatted(.dateTime.weekday(.wide).day().month(.wide).locale(Locale(identifier: "de_DE"))))
                     .font(.footnote.bold()).foregroundStyle(.secondary).padding(.top, 6)
                 ForEach(groups[day] ?? [], id: \.element.id) { i, r in
                     Button {
-                        cursor = Double(i)
+                        model.cursor = i
+                        Haptics.selection()
                     } label: {
                         HStack(spacing: 10) {
-                            Circle().fill(Int(cursor) == i ? d.tint : d.tint.opacity(0.3)).frame(width: 10, height: 10)
+                            Circle().fill(model.cursor == i ? d.tint : d.tint.opacity(0.3)).frame(width: 12, height: 12)
                             Text(r.date.timeDE).font(.subheadline.monospacedDigit())
                             Text("±\(r.accuracy ?? 0) m").font(.caption).foregroundStyle(.secondary)
                             if r.isBatch { badge("×\(r.batchSize ?? 1)", .purple) }
@@ -371,16 +408,17 @@ struct DeviceDetailView: View {
                             Spacer()
                             Text("+\(r.delayMinutes) min").font(.caption2).foregroundStyle(.tertiary)
                         }
+                        .padding(.vertical, 3)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
-            if !showAllRows && rows.count > 150 {
-                Button("Alle \(rows.count) Punkte anzeigen") { showAllRows = true }.buttonStyle(.glass)
+            if !showAllRows && rows.count > 120 {
+                Button("Alle \(rows.count) Punkte anzeigen") { Haptics.light(); showAllRows = true }.buttonStyle(.glass)
             }
-            if reports.isEmpty {
-                Text(loading ? "Lädt …" : "Keine Standorte in diesem Zeitraum.").foregroundStyle(.secondary)
+            if rows.isEmpty {
+                Text("Keine Punkte.").foregroundStyle(.secondary)
             }
         }
     }
@@ -397,66 +435,21 @@ struct DeviceDetailView: View {
             .background(c.opacity(0.85), in: .capsule).foregroundStyle(.white)
     }
 
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                Button { sheet = .edit } label: { Label("Bearbeiten", systemImage: "pencil") }
-                Button { sheet = .alerts } label: { Label("Alarme", systemImage: "bell.badge") }
-                Button { sheet = .lost } label: { Label("Verloren-Modus", systemImage: "exclamationmark.triangle") }
-                Button {
-                    Task { _ = await model.refresh(deviceID: deviceID, full: true); await load(fit: false) }
-                } label: { Label("7-Tage-Scan", systemImage: "clock.arrow.2.circlepath") }
-                if let d = device {
-                    Button {
-                        Task { try? await model.patchDevice(deviceID, ["enabled": !d.enabled]) }
-                    } label: { Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen", systemImage: "pause.circle") }
-                }
-                Divider()
-                Button(role: .destructive) { confirmDelete = true } label: { Label("Entfernen", systemImage: "trash") }
-            } label: {
-                Image(systemName: "ellipsis")
-            }
-        }
-    }
-
     // MARK: Logik
-
-    private func load(fit: Bool) async {
-        loading = true
-        defer { loading = false }
-        let since: Double? = range == .all ? nil : Date().timeIntervalSince1970 - range.rawValue
-        do {
-            reports = try await model.loadHistory(deviceID, since: since)
-            cursor = Double(max(reports.count - 1, 0))
-            writeGPX()
-            if fit { self.fit() }
-        } catch {
-            model.showToast("⚠️ \(error.localizedDescription)")
-        }
-    }
-
-    private func fit() {
-        let coords = reports.map(\.coordinate)
-        if let r = region(fitting: coords, padding: 1.4) {
-            withAnimation(.smooth) { position = .region(r) }
-        } else if let l = device?.last {
-            withAnimation(.smooth) {
-                position = .region(MKCoordinateRegion(center: l.coordinate, latitudinalMeters: 800, longitudinalMeters: 800))
-            }
-        }
-    }
 
     private func toggleGuard(_ d: Device) async {
         do {
             try await model.patchDevice(d.id, ["alerts": ["guard": ["enabled": !d.isGuarded]]])
-            model.showToast(d.isGuarded ? "Wache deaktiviert" : "🛡️ Wache aktiv – Alarm bei Bewegung")
+            Haptics.success()
+            model.showToast(d.isGuarded ? "Wache deaktiviert" : "Wache aktiv – Alarm bei Bewegung")
         } catch {
+            Haptics.warning()
             model.showToast("⚠️ \(error.localizedDescription)")
         }
     }
 
     private func writeGPX() {
+        let reports = model.track
         guard !reports.isEmpty, let d = device else { gpxURL = nil; return }
         let iso = ISO8601DateFormatter()
         var s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"FindMy Ultra\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>\(d.name.replacingOccurrences(of: "<", with: ""))</name><trkseg>\n"
@@ -488,16 +481,28 @@ struct EditDeviceView: View {
 
     var body: some View {
         Form {
+            Section {
+                HStack {
+                    Spacer()
+                    Text(emoji.isEmpty ? "📍" : emoji).font(.system(size: 54))
+                        .frame(width: 96, height: 96)
+                        .background(Color(.tertiarySystemFill), in: .circle)
+                    Spacer()
+                }
+                .listRowBackground(Color.clear)
+            }
             Section("Name & Symbol") {
                 TextField("Name", text: $name)
                 TextField("Emoji", text: $emoji)
                     .onChange(of: emoji) { _, v in if v.count > 2 { emoji = String(v.suffix(1)) } }
+            }
+            Section("Farbe der Spur") {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack {
                         ForEach(palette, id: \.self) { c in
                             Circle().fill(Color(hex: c)).frame(width: 34, height: 34)
                                 .overlay(Circle().stroke(.primary, lineWidth: color == c ? 3 : 0))
-                                .onTapGesture { color = c }
+                                .onTapGesture { color = c; Haptics.selection() }
                         }
                     }
                     .padding(.vertical, 4)
@@ -526,8 +531,9 @@ struct EditDeviceView: View {
                         do {
                             try await model.patchDevice(device.id, ["name": name, "emoji": emoji, "color": color,
                                                                     "retention_days": retention, "enabled": enabled])
+                            Haptics.success()
                             dismiss()
-                        } catch { model.showToast("⚠️ \(error.localizedDescription)") }
+                        } catch { Haptics.warning(); model.showToast("⚠️ \(error.localizedDescription)") }
                     }
                 }
                 .disabled(name.isEmpty || saving)
