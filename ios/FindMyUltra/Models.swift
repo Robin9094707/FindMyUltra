@@ -75,6 +75,9 @@ struct Device: Codable, Identifiable, Hashable {
     var last: Report?
     var battery: String?
     var sort: Int?
+    var category: String?
+
+    var isItem: Bool { (category ?? "item") == "item" }
 
     var tint: Color { Color(hex: color ?? "#0A84FF") }
     var symbol: String { (emoji?.isEmpty == false ? emoji : nil) ?? "📍" }
@@ -142,6 +145,148 @@ struct BarkConfig: Codable, Hashable {
 }
 
 struct QuietHours: Codable, Hashable { var enabled: Bool; var start: String; var end: String }
+
+struct OnlineDevicesConfig: Codable, Hashable {
+    var enabled: Bool
+    var interval: Int
+}
+
+// MARK: - Apple-Geräte (online über iCloud + offline über AirTag-Schlüssel)
+
+struct OnlineLocation: Codable, Hashable {
+    var lat: Double
+    var lon: Double
+    var accuracy: Double?
+    var ts: Double
+    var positionType: String?
+    var isOld: Bool?
+    var coordinate: CLLocationCoordinate2D { .init(latitude: lat, longitude: lon) }
+    var date: Date { Date(timeIntervalSince1970: ts) }
+}
+
+struct BestLocation: Codable, Hashable {
+    var lat: Double
+    var lon: Double
+    var accuracy: Double?
+    var ts: Double
+    var source: String
+    var role: String?
+    var coordinate: CLLocationCoordinate2D { .init(latitude: lat, longitude: lon) }
+    var date: Date { Date(timeIntervalSince1970: ts) }
+    var isOnline: Bool { source == "online" }
+}
+
+struct AppleDevicePart: Codable, Hashable, Identifiable {
+    var role: String
+    var deviceId: String
+    var name: String?
+    var last: Report?
+    var total: Int
+    var id: String { role }
+}
+
+enum PartRole: String, CaseIterable, Identifiable {
+    case main, left, right, `case`
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .main: "Gerät"
+        case .left: "Linker AirPod"
+        case .right: "Rechter AirPod"
+        case .case: "Ladecase"
+        }
+    }
+    var short: String {
+        switch self {
+        case .main: "Offline"
+        case .left: "Links"
+        case .right: "Rechts"
+        case .case: "Case"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .main: "dot.radiowaves.left.and.right"
+        case .left: "airpod.left"
+        case .right: "airpod.right"
+        case .case: "airpods.chargingcase.fill"
+        }
+    }
+}
+
+struct AppleDevice: Codable, Identifiable, Hashable {
+    let id: String
+    var kind: String
+    var mode: String
+    var emoji: String?
+    var model: String?
+    var displayName: String?
+    var deviceClass: String?
+    var batteryLevel: Double?
+    var batteryStatus: String?
+    var deviceStatus: String?
+    var hidden: Bool?
+    var name: String
+    var appleName: String?
+    var online: OnlineLocation?
+    var parts: [AppleDevicePart]
+    var best: BestLocation?
+    var reachable: Bool?
+
+    var isAirPods: Bool { mode == "airpods" }
+    var isCloud: Bool { kind == "fmip" }
+    var roles: [PartRole] { isAirPods ? [.left, .right, .case] : [.main] }
+    func part(_ r: PartRole) -> AppleDevicePart? { parts.first { $0.role == r.rawValue } }
+
+    var symbol: String {
+        if isAirPods { return "airpodspro" }
+        let c = "\(deviceClass ?? "") \(displayName ?? "") \(model ?? "")".lowercased()
+        if c.contains("iphone") { return "iphone.gen3" }
+        if c.contains("ipad") { return "ipad" }
+        if c.contains("watch") { return "applewatch" }
+        if c.contains("macbook") { return "laptopcomputer" }
+        if c.contains("imac") { return "desktopcomputer" }
+        if c.contains("mac") { return "macmini" }
+        if c.contains("vision") { return "visionpro" }
+        if c.contains("airpod") || c.contains("beats") { return "airpodspro" }
+        return "iphone.gen3"
+    }
+
+    var batteryText: String? {
+        guard let b = batteryLevel else { return nil }
+        return "\(Int((b * 100).rounded())) %"
+    }
+    var batteryColor: Color {
+        guard let b = batteryLevel else { return .secondary }
+        return b > 0.5 ? .green : (b > 0.2 ? .yellow : .red)
+    }
+    var batteryIcon: String {
+        guard let b = batteryLevel else { return "battery.100percent.circle" }
+        if batteryStatus == "Charging" { return "battery.100percent.bolt" }
+        return b > 0.75 ? "battery.100percent" : b > 0.5 ? "battery.75percent" : b > 0.25 ? "battery.50percent" : b > 0.1 ? "battery.25percent" : "battery.0percent"
+    }
+}
+
+struct OnlineStatus: Codable, Hashable {
+    var enabled: Bool
+    var interval: Int?
+    var error: String?
+    var lastRefresh: Double?
+}
+
+struct AppleDevicesEnvelope: Codable {
+    var devices: [AppleDevice]
+    var online: OnlineStatus?
+}
+
+struct AppleRefreshResult: Codable {
+    var ok: Bool?
+    var onlineDevices: Int?
+    var newOffline: Int?
+    var onlineError: String?
+    var devices: [AppleDevice]?
+    var online: OnlineStatus?
+}
 
 struct StaysConfig: Codable, Hashable {
     var radiusM: Double
@@ -218,6 +363,7 @@ struct ServerSettings: Codable, Hashable {
     var bark: BarkConfig
     var quietHours: QuietHours
     var stays: StaysConfig?
+    var onlineDevices: OnlineDevicesConfig?
 }
 
 struct Passkey: Codable, Identifiable, Hashable {

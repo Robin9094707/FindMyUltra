@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -210,6 +210,10 @@ DEFAULT_SETTINGS: dict = {
         "min_level": "passive",
     },
     "quiet_hours": {"enabled": False, "start": "23:00", "end": "07:00"},
+    "online_devices": {           # Online-Ortung der Apple-Geräte (iCloud „Wo ist?“)
+        "enabled": True,
+        "interval": 120,          # s zwischen Abfragen
+    },
     "stays": {                    # Aufenthalte / stationäre Orte
         "radius_m": 120,          # max. Abstand zum Mittelpunkt, um als „gleicher Ort“ zu zählen
         "min_minutes": 5,         # Mindestdauer eines Aufenthalts
@@ -308,6 +312,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     ip          TEXT,
     kind        TEXT
 );
+CREATE TABLE IF NOT EXISTS apple_devices (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL DEFAULT 'fmip',   -- fmip (von Apple) | manual
+    mode          TEXT NOT NULL DEFAULT 'device', -- device | airpods
+    name          TEXT NOT NULL,
+    custom_name   TEXT,
+    emoji         TEXT,
+    model         TEXT,
+    display_name  TEXT,
+    device_class  TEXT,
+    battery_level REAL,
+    battery_status TEXT,
+    device_status TEXT,
+    online        TEXT,          -- JSON: letzter Online-Standort
+    links         TEXT NOT NULL DEFAULT '{}',   -- JSON: {rolle: accessory-device-id}
+    hidden        INTEGER NOT NULL DEFAULT 0,
+    sort          INTEGER NOT NULL DEFAULT 0,
+    updated_at    REAL,
+    added_at      REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     k  TEXT PRIMARY KEY,
     v  TEXT NOT NULL
@@ -321,6 +345,10 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        # Migrationen (bestehende Daten bleiben erhalten)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(devices)")}
+        if "category" not in cols:
+            self.db.execute("ALTER TABLE devices ADD COLUMN category TEXT NOT NULL DEFAULT 'item'")
         self.db.commit()
 
     # kv / settings ----------------------------------------------------------
@@ -393,8 +421,12 @@ class Store:
             self.db.execute("DELETE FROM reports WHERE device_id=?", (dev_id,))
         self.db.commit()
 
-    def devices(self) -> list[dict]:
-        rows = self.db.execute("SELECT * FROM devices ORDER BY sort, name COLLATE NOCASE").fetchall()
+    def devices(self, category: str | None = None) -> list[dict]:
+        if category:
+            rows = self.db.execute("SELECT * FROM devices WHERE category=? ORDER BY sort, name COLLATE NOCASE",
+                                   (category,)).fetchall()
+        else:
+            rows = self.db.execute("SELECT * FROM devices ORDER BY sort, name COLLATE NOCASE").fetchall()
         out = []
         for r in rows:
             d = self._dev(r)
@@ -413,6 +445,73 @@ class Store:
 
     def device_public(self, dev_id: str) -> dict | None:
         return next((d for d in self.devices() if d["id"] == dev_id), None)
+
+    # Apple-Geräte -------------------------------------------------------------
+    def apple_rows(self, include_hidden: bool = False) -> list[dict]:
+        q = "SELECT * FROM apple_devices" + ("" if include_hidden else " WHERE hidden=0") + \
+            " ORDER BY sort, COALESCE(custom_name, name) COLLATE NOCASE"
+        out = []
+        for r in self.db.execute(q).fetchall():
+            d = dict(r)
+            d["online"] = json.loads(d["online"]) if d.get("online") else None
+            d["links"] = json.loads(d.get("links") or "{}")
+            d["hidden"] = bool(d["hidden"])
+            out.append(d)
+        return out
+
+    def apple_row(self, aid: str) -> dict | None:
+        return next((d for d in self.apple_rows(True) if d["id"] == aid), None)
+
+    def apple_upsert_fmip(self, dev: dict) -> None:
+        aid = dev["id"]
+        exists = self.db.execute("SELECT 1 FROM apple_devices WHERE id=?", (aid,)).fetchone()
+        vals = (dev["name"], dev.get("model"), dev.get("display_name"), dev.get("device_class"),
+                dev.get("battery_level"), dev.get("battery_status"), dev.get("device_status"),
+                json.dumps(dev["online"]) if dev.get("online") else None, now())
+        if exists:
+            # Online-Standort nur überschreiben, wenn neu vorhanden (sonst letzten behalten)
+            if dev.get("online"):
+                self.db.execute("UPDATE apple_devices SET name=?, model=?, display_name=?, device_class=?, "
+                                "battery_level=?, battery_status=?, device_status=?, online=?, updated_at=? "
+                                "WHERE id=?", (*vals, aid))
+            else:
+                self.db.execute("UPDATE apple_devices SET name=?, model=?, display_name=?, device_class=?, "
+                                "battery_level=?, battery_status=?, device_status=?, updated_at=? WHERE id=?",
+                                (*vals[:7], vals[8], aid))
+        else:
+            mode = "airpods" if "airpod" in " ".join(str(dev.get(k) or "") for k in
+                                                     ("device_class", "display_name", "model", "name")).lower() else "device"
+            sort = self.db.execute("SELECT COALESCE(MAX(sort),0)+1 FROM apple_devices").fetchone()[0]
+            self.db.execute("INSERT INTO apple_devices(id,kind,mode,name,model,display_name,device_class,"
+                            "battery_level,battery_status,device_status,online,updated_at,links,sort,added_at) "
+                            "VALUES(?,'fmip',?,?,?,?,?,?,?,?,?,?,'{}',?,?)", (aid, mode, *vals, sort, now()))
+        self.db.commit()
+
+    def apple_create(self, name: str, mode: str, device_class: str | None) -> str:
+        aid = "m-" + secrets.token_hex(6)
+        sort = self.db.execute("SELECT COALESCE(MAX(sort),0)+1 FROM apple_devices").fetchone()[0]
+        self.db.execute("INSERT INTO apple_devices(id,kind,mode,name,device_class,links,sort,added_at) "
+                        "VALUES(?,'manual',?,?,?,'{}',?,?)", (aid, mode, name, device_class, sort, now()))
+        self.db.commit()
+        return aid
+
+    def apple_update(self, aid: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols, vals = [], []
+        for k, v in fields.items():
+            if k in ("links", "online"):
+                v = json.dumps(v) if v is not None else None
+            if k == "hidden":
+                v = int(bool(v))
+            cols.append(f"{k}=?")
+            vals.append(v)
+        self.db.execute(f"UPDATE apple_devices SET {', '.join(cols)} WHERE id=?", (*vals, aid))
+        self.db.commit()
+
+    def apple_delete(self, aid: str) -> None:
+        self.db.execute("DELETE FROM apple_devices WHERE id=?", (aid,))
+        self.db.commit()
 
     # reports ----------------------------------------------------------------
     def newest_ts(self, dev_id: str) -> float:
@@ -1061,7 +1160,7 @@ class Registry:
             if alignment_of(t.accessory) != t.align_saved:
                 self.save(t)
 
-    def import_bytes(self, raw: bytes, filename: str = "") -> list[dict]:
+    def import_bytes(self, raw: bytes, filename: str = "", category: str = "item") -> list[dict]:
         added = []
         for acc, meta in parse_key_file(raw, filename):
             did = accessory_id(acc)
@@ -1079,6 +1178,12 @@ class Registry:
                                         getattr(acc, "serial_number", None), self._kind(acc))
             if not new and meta.get("emoji"):
                 self.st.store.update_device(did, emoji=meta["emoji"])
+            if category != "item":
+                row = self.st.store.device_row(did)
+                alerts = row["alerts"] if row else copy.deepcopy(DEFAULT_ALERTS)
+                if new:
+                    alerts["battery"]["enabled"] = False  # Statusbyte bei Apple-Geräten nicht aussagekräftig
+                self.st.store.update_device(did, category=category, alerts=alerts)
             added.append({"id": did, "name": name, "new": new})
         return added
 
@@ -1172,6 +1277,171 @@ def index_range(acc: Any, mode: str, quick_hours: float) -> tuple[int, int]:
 # ════════════════════════════════════════════════════════════════════════════
 #  Benachrichtigungen (Bark) & Alarme
 # ════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Apple-Geräte: Online-Ortung (iCloud „Wo ist?“) + Offline (AirTag-Schlüssel)
+# ════════════════════════════════════════════════════════════════════════════
+
+AIRPODS_ROLES = ("left", "right", "case")
+
+
+class OnlineDevices:
+    """Fragt die Online-Standorte der Apple-Geräte über den FMIP-Dienst ab
+    (gleiche Apple-Anmeldung wie für die Offline-Berichte, Token „mmeFMIPToken“)."""
+
+    def __init__(self, st: "State") -> None:
+        self.st = st
+        self.host = "fmipmobile.icloud.com"
+        self.error: str | None = None
+        self.last_refresh: float | None = None
+        self.failures = 0
+        self.event = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.udid = st.store.kv_get("fmip_udid") or secrets.token_hex(20)
+        st.store.kv_set("fmip_udid", self.udid)
+
+    def status(self) -> dict:
+        cfg = self.st.store.settings()["online_devices"]
+        return {"enabled": bool(cfg.get("enabled")), "interval": cfg.get("interval"),
+                "error": self.error, "last_refresh": self.last_refresh}
+
+    def _auth(self) -> tuple[str, str]:
+        acc = self.st.apple.account
+        data = getattr(acc, "_login_state_data", {}) or {}
+        dsid = str(data.get("dsid") or "")
+        tokens = (data.get("mobileme_data") or {}).get("tokens") or {}
+        tok = tokens.get("mmeFMIPToken") or tokens.get("mmeFMIPAppToken")
+        if not dsid or not tok:
+            raise RuntimeError("Kein FMIP-Token in der Apple-Sitzung – bitte Apple-Account neu anmelden.")
+        return dsid, tok
+
+    async def _post(self, path: str, body: dict) -> dict:
+        import aiohttp
+        dsid, tok = self._auth()
+        headers = {
+            "X-Apple-Realm-Support": "1.0",
+            "X-Apple-Find-Api-Ver": "3.0",
+            "X-Apple-AuthScheme": "Forever",
+            "User-Agent": "FindMyiPhone/500 CFNetwork/1568.100.1 Darwin/24.0.0",
+            "Accept-Language": "de-DE",
+            "Content-Type": "application/json",
+        }
+        with contextlib.suppress(Exception):
+            headers.update(await self.st.apple.account.get_anisette_headers())
+        s = await self.st.notifier.session()
+        for _ in range(3):
+            url = f"https://{self.host}/fmipservice/device/{dsid}/{path}"
+            async with s.post(url, json=body, headers=headers, auth=aiohttp.BasicAuth(dsid, tok)) as r:
+                if r.status == 330 and r.headers.get("X-Apple-MMe-Host"):
+                    self.host = r.headers["X-Apple-MMe-Host"]
+                    continue
+                if r.status in (401, 403):
+                    raise PermissionError(f"Apple hat die Online-Abfrage abgelehnt ({r.status}).")
+                if r.status >= 400:
+                    raise RuntimeError(f"FMIP-Fehler {r.status}: {(await r.text())[:200]}")
+                return await r.json(content_type=None)
+        raise RuntimeError("Zu viele Umleitungen beim FMIP-Dienst")
+
+    def _context(self) -> dict:
+        return {"clientContext": {
+            "appName": "FindMyiPhone", "appVersion": "7.0", "buildVersion": "1036",
+            "clientTimestamp": int(now() * 1000), "deviceUDID": self.udid, "inactiveTime": 1,
+            "osVersion": "18.0", "productType": "iPhone16,1", "fmly": True, "shouldLocate": True,
+            "selectedDevice": "all"}}
+
+    @staticmethod
+    def _parse(d: dict) -> dict:
+        loc = d.get("location") or None
+        online = None
+        if loc and loc.get("latitude") is not None:
+            online = {"lat": round(float(loc["latitude"]), 7), "lon": round(float(loc["longitude"]), 7),
+                      "accuracy": round(float(loc.get("horizontalAccuracy") or 0)),
+                      "ts": float(loc.get("timeStamp") or 0) / 1000.0,
+                      "position_type": loc.get("positionType"), "is_old": bool(loc.get("isOld")),
+                      "inaccurate": bool(loc.get("isInaccurate"))}
+        bl = d.get("batteryLevel")
+        return {"id": str(d.get("id")), "name": d.get("name") or d.get("deviceDisplayName") or "Gerät",
+                "model": d.get("rawDeviceModel") or d.get("deviceModel"),
+                "display_name": d.get("deviceDisplayName"), "device_class": d.get("deviceClass"),
+                "battery_level": float(bl) if isinstance(bl, (int, float)) and bl > 0 else None,
+                "battery_status": d.get("batteryStatus"), "device_status": str(d.get("deviceStatus") or ""),
+                "online": online}
+
+    async def refresh(self) -> int:
+        if self.st.args.demo:
+            return 0
+        if not self.st.apple.logged_in:
+            self.error = "Nicht bei Apple angemeldet"
+            return 0
+        async with self.lock:
+            try:
+                try:
+                    j = await self._post("initClient", self._context())
+                except PermissionError:
+                    # Token auffrischen und einmal erneut versuchen
+                    await self.st.apple.account._login_mobileme()
+                    self.st.apple.save()
+                    j = await self._post("initClient", self._context())
+                items = [self._parse(d) for d in (j.get("content") or []) if d.get("id")]
+                for it in items:
+                    self.st.store.apple_upsert_fmip(it)
+                self.error = None
+                self.failures = 0
+                self.last_refresh = now()
+                self.st.hub.publish("apple_devices", {"changed": True})
+                return len(items)
+            except Exception as e:  # noqa: BLE001
+                self.failures += 1
+                self.error = f"{type(e).__name__}: {e}"
+                log.warning("Online-Ortung fehlgeschlagen: %s", self.error)
+                return 0
+
+    async def play_sound(self, aid: str) -> None:
+        await self._post("playSound", {**self._context(), "device": aid,
+                                       "subject": "FindMy Ultra"})
+
+    async def loop(self) -> None:
+        await asyncio.sleep(5)
+        while True:
+            cfg = self.st.store.settings()["online_devices"]
+            if cfg.get("enabled") and self.st.apple.logged_in:
+                await self.refresh()
+            wait = max(30, int(cfg.get("interval", 120))) * min(2 ** self.failures, 16)
+            self.event.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.event.wait(), timeout=wait)
+
+
+def apple_device_public(st: "State", d: dict) -> dict:
+    """Fügt Online- und Offline-Standorte (AirTag-Schlüssel) zusammen."""
+    parts = []
+    for role, did in (d.get("links") or {}).items():
+        last = st.store.db.execute("SELECT * FROM reports WHERE device_id=? ORDER BY ts DESC LIMIT 1",
+                                   (did,)).fetchone()
+        dev = st.store.device_row(did)
+        parts.append({"role": role, "device_id": did, "name": dev["name"] if dev else None,
+                      "last": dict(last) if last else None,
+                      "total": st.store.db.execute("SELECT COUNT(*) FROM reports WHERE device_id=?",
+                                                   (did,)).fetchone()[0]})
+    order = {"main": 0, "left": 1, "right": 2, "case": 3}
+    parts.sort(key=lambda p: order.get(p["role"], 9))
+    cands = []
+    on = d.get("online")
+    if on and on.get("ts"):
+        cands.append({**{k: on[k] for k in ("lat", "lon", "accuracy", "ts")}, "source": "online", "role": None})
+    for p in parts:
+        if p["last"]:
+            l = p["last"]
+            cands.append({"lat": l["lat"], "lon": l["lon"], "accuracy": l["accuracy"], "ts": l["ts"],
+                          "source": "offline", "role": p["role"]})
+    best = max(cands, key=lambda c: c["ts"]) if cands else None
+    out = {k: d.get(k) for k in ("id", "kind", "mode", "emoji", "model", "display_name", "device_class",
+                                 "battery_level", "battery_status", "device_status", "hidden", "sort",
+                                 "updated_at")}
+    out.update(name=d.get("custom_name") or d.get("name"), apple_name=d.get("name"), online=on,
+               parts=parts, best=best, reachable=d.get("device_status") in ("200", "201"))
+    return out
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Aufenthalte (Stay-Point-Erkennung mit Ausreißer-Toleranz)
@@ -1594,6 +1864,7 @@ class State:
     registry: Any = None
     notifier: Any = None
     alerts: Any = None
+    online: Any = None
     poll_event: asyncio.Event = field(default_factory=asyncio.Event)
     poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: list = field(default_factory=list)
@@ -1738,6 +2009,16 @@ class DemoApple:
 
 async def demo_setup(st: State) -> None:
     st.apple = DemoApple()
+    # Demo-Apple-Geräte (online)
+    for aid, name, cls, model, pos, bl in [("demo-iphone", "iPhone von Demo", "iPhone", "iPhone16,1", (52.5163, 13.3777), 0.82),
+                                          ("demo-mac", "MacBook Pro", "MacBookPro", "Mac15,9", (52.5250, 13.4100), 0.47),
+                                          ("demo-airpods", "AirPods Pro", "Accessory", "AirPodsPro", (52.5120, 13.3900), None)]:
+        st.store.apple_upsert_fmip({"id": aid, "name": name, "model": model, "display_name": name,
+                                    "device_class": cls, "battery_level": bl, "battery_status": "NotCharging",
+                                    "device_status": "200",
+                                    "online": {"lat": pos[0], "lon": pos[1], "accuracy": 35,
+                                               "ts": now() - random.randint(60, 1800),
+                                               "position_type": "Wifi", "is_old": False, "inaccurate": False}})
     seeds = [("demo-keys", "Schlüssel", "🔑", (52.5200, 13.4050)),
              ("demo-bag", "Rucksack", "🎒", (52.5310, 13.3850)),
              ("demo-bike", "Fahrrad", "🚲", (52.5080, 13.4300))]
@@ -2052,6 +2333,11 @@ def build_app(st: State) -> web.Application:
         s["day_sweep_minutes"] = max(2, int(s["day_sweep_minutes"]))
         s["full_sweep_minutes"] = max(10, int(s["full_sweep_minutes"]))
         s["retention_days"] = max(0, int(s["retention_days"]))
+        od = s["online_devices"]
+        od["enabled"] = bool(od.get("enabled"))
+        od["interval"] = max(30, int(od.get("interval", 120)))
+        if st.online:
+            st.online.event.set()
         sc = s["stays"]
         sc["radius_m"] = max(20.0, min(2000.0, float(sc["radius_m"])))
         sc["min_minutes"] = max(1.0, float(sc["min_minutes"]))
@@ -2146,8 +2432,8 @@ def build_app(st: State) -> web.Application:
         return web.json_response({"ok": True})
 
     # --- Geräte --------------------------------------------------------------------------
-    async def devices(_: web.Request) -> web.Response:
-        return web.json_response({"devices": st.store.devices()})
+    async def devices(req: web.Request) -> web.Response:
+        return web.json_response({"devices": st.store.devices(req.query.get("category"))})
 
     async def device_get(req: web.Request) -> web.Response:
         d = st.store.device_public(req.match_info["id"])
@@ -2210,6 +2496,145 @@ def build_app(st: State) -> web.Application:
         q = req.query
         return web.json_response({"reports": st.store.reports(
             _f(q.get("since")), _f(q.get("until")), req.match_info["id"], int(q.get("limit", 50000)))})
+
+    # --- Apple-Geräte -----------------------------------------------------------------
+    def apple_list() -> dict:
+        devs = [apple_device_public(st, d) for d in st.store.apple_rows()]
+        return {"devices": devs, "online": st.online.status() if st.online else {"enabled": False}}
+
+    async def apple_devices(_: web.Request) -> web.Response:
+        return web.json_response(apple_list())
+
+    async def apple_create_route(req: web.Request) -> web.Response:
+        b = await req.json()
+        mode = "airpods" if b.get("mode") == "airpods" else "device"
+        aid = st.store.apple_create((b.get("name") or ("AirPods" if mode == "airpods" else "Gerät"))[:80],
+                                    mode, b.get("device_class") or ("Accessory" if mode == "airpods" else None))
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(apple_device_public(st, st.store.apple_row(aid)))
+
+    async def apple_patch(req: web.Request) -> web.Response:
+        aid = req.match_info["id"]
+        row = st.store.apple_row(aid)
+        if not row:
+            return jerr(404, "Unbekanntes Gerät")
+        b = await req.json()
+        upd: dict = {}
+        if "name" in b:
+            upd["custom_name"] = (b["name"] or "").strip()[:80] or None
+        if "emoji" in b:
+            upd["emoji"] = (b["emoji"] or "")[:8] or None
+        if "mode" in b and b["mode"] in ("device", "airpods"):
+            upd["mode"] = b["mode"]
+        if "hidden" in b:
+            upd["hidden"] = bool(b["hidden"])
+        if "sort" in b:
+            upd["sort"] = int(b["sort"])
+        st.store.apple_update(aid, **upd)
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(apple_device_public(st, st.store.apple_row(aid)))
+
+    def _unlink(row: dict, role: str) -> None:
+        did = (row.get("links") or {}).pop(role, None)
+        if did and did not in (row.get("links") or {}).values():
+            st.registry.remove(did)
+            st.store.delete_device(did)
+
+    async def apple_delete_route(req: web.Request) -> web.Response:
+        aid = req.match_info["id"]
+        row = st.store.apple_row(aid)
+        if not row:
+            return jerr(404, "Unbekanntes Gerät")
+        for role in list((row.get("links") or {}).keys()):
+            _unlink(row, role)
+        if row["kind"] == "fmip":
+            st.store.apple_update(aid, hidden=True, links={})  # kommt sonst beim nächsten Abruf wieder
+        else:
+            st.store.apple_delete(aid)
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response({"ok": True})
+
+    async def apple_offline_import(req: web.Request) -> web.Response:
+        need_real()
+        aid = req.match_info["id"]
+        row = st.store.apple_row(aid)
+        if not row:
+            return jerr(404, "Unbekanntes Gerät")
+        role = req.query.get("role", "main")
+        if role not in ("main", *AIRPODS_ROLES):
+            return jerr(400, "Rolle muss main, left, right oder case sein")
+        raw, name = b"", "upload"
+        if req.content_type.startswith("multipart/"):
+            reader = await req.multipart()
+            async for part in reader:
+                if part.filename or part.name in ("file", "files"):
+                    raw, name = await part.read(decode=True), part.filename or "upload"
+                    break
+        else:
+            raw = await req.read()
+        if not raw:
+            return jerr(400, "Keine Datei erhalten")
+        try:
+            for acc, _meta in parse_key_file(raw, name):
+                ex = st.store.device_row(accessory_id(acc))
+                if ex and ex.get("category", "item") == "item":
+                    return jerr(409, f"Diese Schlüsseldatei ist bereits als Objekt „{ex['name']}“ importiert. "
+                                     "Entferne das Objekt zuerst, wenn sie zu diesem Gerät gehören soll.")
+            added = st.registry.import_bytes(raw, name, category="apple_device")
+        except Exception as e:  # noqa: BLE001
+            return jerr(400, f"{type(e).__name__}: {e}")
+        if not added:
+            return jerr(400, "Keine Schlüssel in der Datei")
+        new_id = added[0]["id"]
+        links = row.get("links") or {}
+        old = links.get(role)
+        if old and old != new_id:
+            _unlink(row, role)
+            links = row.get("links") or {}
+        links[role] = new_id
+        st.store.apple_update(aid, links=links)
+        label = {"main": "", "left": " (links)", "right": " (rechts)", "case": " (Case)"}[role]
+        st.store.update_device(new_id, name=f"{row.get('custom_name') or row['name']}{label}")
+        st.wake([new_id], full=True)
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(apple_device_public(st, st.store.apple_row(aid)))
+
+    async def apple_offline_remove(req: web.Request) -> web.Response:
+        aid = req.match_info["id"]
+        row = st.store.apple_row(aid)
+        if not row:
+            return jerr(404, "Unbekanntes Gerät")
+        _unlink(row, req.match_info["role"])
+        st.store.apple_update(aid, links=row.get("links") or {})
+        st.hub.publish("apple_devices", {"changed": True})
+        return web.json_response(apple_device_public(st, st.store.apple_row(aid)))
+
+    async def apple_refresh(req: web.Request) -> web.Response:
+        b = await req.json() if req.can_read_body else {}
+        n = await st.online.refresh() if st.online and not st.args.demo else 0
+        linked = [did for d in st.store.apple_rows() for did in (d.get("links") or {}).values()]
+        aid = b.get("id")
+        if aid:
+            row = st.store.apple_row(aid)
+            linked = list((row or {}).get("links", {}).values())
+        res = {"new": 0}
+        if linked:
+            fut = st.wake(linked, full=bool(b.get("full", True)))
+            with contextlib.suppress(asyncio.TimeoutError):
+                res = await asyncio.wait_for(asyncio.shield(fut), timeout=float(b.get("timeout", 90)))
+        return web.json_response({"ok": True, "online_devices": n, "new_offline": res.get("new", 0),
+                                  "online_error": st.online.error if st.online else None, **apple_list()})
+
+    async def apple_sound(req: web.Request) -> web.Response:
+        need_real()
+        row = st.store.apple_row(req.match_info["id"])
+        if not row or row["kind"] != "fmip":
+            return jerr(400, "Ton nur bei online verbundenen Apple-Geräten möglich")
+        try:
+            await st.online.play_sound(row["id"])
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Ton fehlgeschlagen: {e}")
+        return web.json_response({"ok": True})
 
     async def new_since(req: web.Request) -> web.Response:
         """Neue Berichte je Objekt seit Zeitpunkt X (nach Eingang beim Server)."""
@@ -2375,6 +2800,14 @@ def build_app(st: State) -> web.Application:
     r.add_get("/api/devices/{id}/reports", device_reports)
     r.add_get("/api/devices/{id}/stays", device_stays)
     r.add_get("/api/new", new_since)
+    r.add_get("/api/apple-devices", apple_devices)
+    r.add_post("/api/apple-devices", apple_create_route)
+    r.add_post("/api/apple-devices/refresh", apple_refresh)
+    r.add_patch("/api/apple-devices/{id}", apple_patch)
+    r.add_delete("/api/apple-devices/{id}", apple_delete_route)
+    r.add_post("/api/apple-devices/{id}/offline", apple_offline_import)
+    r.add_delete("/api/apple-devices/{id}/offline/{role}", apple_offline_remove)
+    r.add_post("/api/apple-devices/{id}/sound", apple_sound)
     r.add_get("/api/devices/{id}/keys", device_export_keys)
     r.add_get("/api/reports", all_reports)
     r.add_post("/api/import", import_keys)
@@ -2660,6 +3093,7 @@ async def amain(args: argparse.Namespace) -> None:
     st = State(store=store, hub=Hub(), args=args, creds=creds, webauthn=WebAuthn(creds))
     st.registry = Registry(st)
     st.notifier = Notifier(st)
+    st.online = OnlineDevices(st)
     st.alerts = Alerts(st)
 
     tasks: list[asyncio.Task] = []
@@ -2680,6 +3114,7 @@ async def amain(args: argparse.Namespace) -> None:
                         log.warning("%s: %s", f.name, e)
         await st.apple.restore()
         tasks.append(asyncio.create_task(scheduler(st)))
+        tasks.append(asyncio.create_task(st.online.loop()))
 
     app = build_app(st)
     runner = web.AppRunner(app, access_log=None)

@@ -43,7 +43,9 @@ struct FindSheet: View {
         NavigationStack(path: $model.sheetPath) {
             root
                 .toolbar(.hidden, for: .navigationBar)
-                .navigationDestination(for: DeviceRoute.self) { DeviceDetailView(deviceID: $0.id) }
+                .navigationDestination(for: DeviceRoute.self) { r in
+                    if r.apple { AppleDeviceDetailView(deviceID: r.id) } else { DeviceDetailView(deviceID: r.id) }
+                }
         }
         .overlay(alignment: .top) {
             if let t = model.toast {
@@ -62,6 +64,7 @@ struct FindSheet: View {
             Group {
                 switch model.section {
                 case .items: DeviceListView()
+                case .devices: DevicesTabView()
                 case .alerts: NotificationsView()
                 case .me: SettingsView()
                 }
@@ -88,14 +91,14 @@ struct SectionBar: View {
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: s.icon)
-                            Text(s.title).lineLimit(1)
+                            Text(s.short).lineLimit(1).minimumScaleFactor(0.8)
                             if s == .alerts && model.unreadAlerts > 0 {
                                 Text("\(model.unreadAlerts)")
                                     .font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 1)
                                     .background(.red, in: .capsule).foregroundStyle(.white)
                             }
                         }
-                        .font(.subheadline.weight(.semibold))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(model.section == s ? Color.primary : Color.secondary)
                         .padding(.vertical, 9)
                         .frame(maxWidth: .infinity)

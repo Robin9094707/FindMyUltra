@@ -140,6 +140,18 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         }
     }
 
+    func uploadOne<T: Decodable>(_ path: String, query: [URLQueryItem] = [], name: String, data: Data) async throws -> T {
+        let boundary = "fmu-\(UUID().uuidString)"
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(name)\"\r\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+        body.append(data)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        return try decode(try await raw("POST", path, query: query, body: body,
+                                        contentType: "multipart/form-data; boundary=\(boundary)"))
+    }
+
     func decode<T: Decodable>(_ data: Data) throws -> T {
         do { return try decoder.decode(T.self, from: data) } catch {
             throw APIError.decoding(String(describing: error).prefix(300).description)

@@ -48,6 +48,7 @@ struct SettingsView: View {
             if draft != nil {
                 pollingSection
                 historySection
+                appleSection
                 staysSection
                 barkSection
                 zonesSection
@@ -228,6 +229,25 @@ struct SettingsView: View {
             Text("Benachrichtigungen (Bark)")
         } footer: {
             Text("Installiere die App „Bark“, kopiere deine Push-URL (https://api.day.app/DEINKEY) und füge sie hier ein. Kritische Hinweise durchbrechen Stumm- und Fokus-Modus. Erst „Sichern“, dann testen.")
+        }
+    }
+
+    @ViewBuilder
+    private var appleSection: some View {
+        let d = draftBinding
+        if d.wrappedValue.onlineDevices != nil {
+            let od = Binding<OnlineDevicesConfig>(get: { d.wrappedValue.onlineDevices! }, set: { d.wrappedValue.onlineDevices = $0 })
+            Section {
+                Toggle("Online-Ortung (iCloud)", isOn: od.enabled)
+                Picker("Abfrage alle", selection: od.interval) {
+                    ForEach([60, 120, 300, 600, 1800], id: \.self) { Text(secs($0)).tag($0) }
+                }
+                if let e = model.onlineStatus?.error { Text(e).font(.footnote).foregroundStyle(.orange) }
+            } header: {
+                Text("Apple-Geräte")
+            } footer: {
+                Text("Optional: Fragt die Online-Standorte deiner iPhones, iPads, Macs, Watches und AirPods mit derselben Apple-Anmeldung ab. Offline-Standorte kommen zusätzlich über importierte Schlüsseldateien im Geräte-Tab. Kein Standortverlauf.")
+            }
         }
     }
 

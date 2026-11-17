@@ -8,24 +8,37 @@ import CoreLocation
 import MapKit
 
 enum SheetSection: String, CaseIterable, Identifiable {
-    case items, alerts, me
+    case items, devices, alerts, me
     var id: String { rawValue }
     var title: String {
         switch self {
         case .items: "Objekte"
+        case .devices: "Geräte"
         case .alerts: "Mitteilungen"
+        case .me: "Ich"
+        }
+    }
+    var short: String {
+        switch self {
+        case .items: "Objekte"
+        case .devices: "Geräte"
+        case .alerts: "Alarme"
         case .me: "Ich"
         }
     }
     var icon: String {
         switch self {
         case .items: "circle.grid.2x2.fill"
+        case .devices: "iphone.gen3"
         case .alerts: "bell.fill"
         case .me: "person.crop.circle.fill"
         }
     }
 }
-struct DeviceRoute: Hashable { let id: String }
+struct DeviceRoute: Hashable {
+    let id: String
+    var apple: Bool = false
+}
 
 enum CircleMode: String, CaseIterable, Identifiable {
     case off, selected, all
@@ -55,6 +68,15 @@ final class AppModel {
 
     // Daten
     var devices: [Device] = []
+    var items: [Device] { devices.filter(\.isItem) }
+    var appleDevices: [AppleDevice] = []
+    var onlineStatus: OnlineStatus?
+    var focusedAppleID: String?
+    var isRefreshingApple = false
+    var showAppleOnMap: Bool = UserDefaults.standard.object(forKey: "showAppleOnMap") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showAppleOnMap, forKey: "showAppleOnMap") }
+    }
+    private var appleReloadTask: Task<Void, Never>?
     var status: ServerStatus?
     var settings: ServerSettings?
     var me: MeInfo?
@@ -226,6 +248,7 @@ final class AppModel {
         settings = sett
         me = mm
         notifications = nn.notifications
+        await reloadAppleDevices()
     }
 
     func reloadDevices() async {
@@ -325,7 +348,71 @@ final class AppModel {
         }
     }
 
+    // MARK: Apple-Geräte
+
+    func appleDevice(_ id: String) -> AppleDevice? { appleDevices.first { $0.id == id } }
+
+    func reloadAppleDevices() async {
+        guard let api else { return }
+        if let r: AppleDevicesEnvelope = try? await api.get("/api/apple-devices") {
+            appleDevices = r.devices
+            onlineStatus = r.online
+        }
+    }
+
+    func scheduleAppleReload() {
+        appleReloadTask?.cancel()
+        appleReloadTask = Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            if !Task.isCancelled { await reloadAppleDevices() }
+        }
+    }
+
+    func openApple(_ id: String) {
+        Haptics.selection()
+        section = .devices
+        if sheetPath.last?.id != id { sheetPath = [DeviceRoute(id: id, apple: true)] }
+        if detent == .peek { detent = .medium }
+    }
+
+    func focusApple(_ id: String) {
+        focusedID = nil
+        track = []
+        focusedAppleID = id
+        if let b = appleDevice(id)?.best { show(center: b.coordinate, meters: max(700, (b.accuracy ?? 50) * 8)) }
+    }
+
+    func refreshApple(_ id: String? = nil) async {
+        guard let api, !isRefreshingApple else { return }
+        Haptics.soft()
+        isRefreshingApple = true
+        defer { isRefreshingApple = false }
+        var body: [String: Any] = ["full": thoroughRefresh, "timeout": 90]
+        if let id { body["id"] = id }
+        do {
+            let r: AppleRefreshResult = try await api.send("POST", "/api/apple-devices/refresh", json: body, timeout: 110)
+            if let d = r.devices { appleDevices = d }
+            onlineStatus = r.online ?? onlineStatus
+            await reloadDevices()
+            if let e = r.onlineError, onlineStatus?.enabled == true {
+                Haptics.warning(); showToast("Online: \(e)")
+            } else {
+                Haptics.success()
+                let n = r.newOffline ?? 0
+                showToast(n > 0 ? "Geräte aktualisiert · \(n) neue Offline-Standorte" : "Geräte aktualisiert")
+            }
+        } catch {
+            Haptics.warning()
+            showToast("⚠️ \(error.localizedDescription)")
+        }
+    }
+
     func openDevice(_ id: String) {
+        if let d = device(id), !d.isItem,
+           let a = appleDevices.first(where: { $0.parts.contains { $0.deviceId == id } }) {
+            openApple(a.id)
+            return
+        }
         Haptics.selection()
         section = .items
         if sheetPath.last?.id != id { sheetPath = [DeviceRoute(id: id)] }
@@ -361,6 +448,7 @@ final class AppModel {
     }
 
     func clearFocus() {
+        focusedAppleID = nil
         focusedID = nil
         track = []
         cursor = nil
@@ -460,8 +548,14 @@ final class AppModel {
     }
 
     func fitAll() {
-        let coords = devices.compactMap(\.last).map(\.coordinate)
+        var coords = items.compactMap(\.last).map(\.coordinate)
+        if showAppleOnMap { coords += appleDevices.compactMap(\.best).map(\.coordinate) }
         if let r = region(fitting: coords, padding: 1.6) { show(region: r) }
+    }
+
+    func distanceFromUser(lat: Double, lon: Double) -> String? {
+        guard let loc = LocationPermission.manager.location else { return nil }
+        return formatDistance(loc.distance(from: CLLocation(latitude: lat, longitude: lon)))
     }
 
     func distanceFromUser(_ r: Report) -> String? {
@@ -543,6 +637,9 @@ final class AppModel {
                 if sinceTs != nil {
                     Task { await loadNewSince() }
                 }
+                if appleDevices.contains(where: { $0.parts.contains { $0.deviceId == r.deviceId } }) {
+                    scheduleAppleReload()
+                }
                 if r.deviceId == focusedID {
                     let atEnd = cursor == nil || cursor == track.count - 1
                     let since = historyRange == .all ? 0 : Date().timeIntervalSince1970 - historyRange.rawValue
@@ -554,6 +651,8 @@ final class AppModel {
                     reloadStays(delay: 1.5)
                 }
             }
+        case "apple_devices":
+            scheduleAppleReload()
         case "settings":
             if let s = try? api.decoder.decode(ServerSettings.self, from: data) { settings = s }
         case "notification":

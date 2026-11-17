@@ -14,7 +14,7 @@ struct DeviceListView: View {
                 }
             }
             Section {
-                ForEach(model.devices) { d in
+                ForEach(model.items) { d in
                     Button {
                         model.openDevice(d.id)
                     } label: {
@@ -54,7 +54,7 @@ struct DeviceListView: View {
                 .textCase(nil)
             }
 
-            if model.devices.isEmpty {
+            if model.items.isEmpty {
                 ContentUnavailableView {
                     Label("Keine Objekte", systemImage: "airtag")
                 } description: {

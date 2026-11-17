@@ -5,6 +5,7 @@ enum MapSel: Hashable {
     case device(String)
     case report(Int)
     case stay(String)
+    case apple(String)
 }
 
 struct Pin: Identifiable {
@@ -24,7 +25,7 @@ struct MapScreen: View {
     @State private var showStyleMenu = false
 
     private var pins: [Pin] {
-        model.devices.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
+        model.items.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
     }
 
     private var focused: Device? { model.focusedID.flatMap { model.device($0) } }
@@ -91,6 +92,7 @@ struct MapScreen: View {
                 case .device(let id): model.openDevice(id)
                 case .report(let rid): model.select(reportID: rid)
                 case .stay(let sid): if let st = model.stays.first(where: { $0.id == sid }) { model.select(stay: st) }
+                case .apple(let aid): model.openApple(aid)
                 case nil: break
                 }
             }
@@ -161,6 +163,41 @@ struct MapScreen: View {
                 }
             }
 
+            // Apple-Geräte (bester Standort: online oder offline)
+            if model.showAppleOnMap {
+                ForEach(model.appleDevices.filter { $0.best != nil }) { a in
+                    if let b = a.best {
+                        if model.circleMode != .off {
+                            MapCircle(center: b.coordinate, radius: CLLocationDistance(max(b.accuracy ?? 5, 5)))
+                                .foregroundStyle(Color.blue.opacity(0.1))
+                                .stroke(Color.blue.opacity(0.45), lineWidth: 1)
+                        }
+                        Annotation(a.name, coordinate: b.coordinate, anchor: .bottom) {
+                            ApplePin(device: a, selected: a.id == model.focusedAppleID)
+                        }
+                        .tag(MapSel.apple(a.id))
+                        .annotationTitles(a.id == model.focusedAppleID ? .visible : .automatic)
+                    }
+                }
+            }
+            // AirPods/Teile des ausgewählten Geräts einzeln (links/rechts/Case/online)
+            if let a = model.focusedAppleID.flatMap({ model.appleDevice($0) }) {
+                ForEach(a.parts.filter { $0.last != nil && !(a.best?.role == $0.role && a.best?.isOnline == false) }) { p in
+                    if let l = p.last, let role = PartRole(rawValue: p.role) {
+                        Annotation(role.short, coordinate: l.coordinate, anchor: .bottom) {
+                            ApplePin(device: a, selected: false, symbolOverride: role == .main ? nil : role.symbol,
+                                     label: role == .main ? "OFF" : role.short.uppercased())
+                                .scaleEffect(0.8, anchor: .bottom)
+                        }
+                    }
+                }
+                if let o = a.online, a.best?.isOnline == false {
+                    Annotation("Online", coordinate: o.coordinate, anchor: .bottom) {
+                        ApplePin(device: a, selected: false, label: "ON").scaleEffect(0.8, anchor: .bottom)
+                    }
+                }
+            }
+
             // Objekte (AirTag-Pins)
             ForEach(pins) { p in
                 if model.circleMode != .off && (p.device.id != model.focusedID || !model.historyVisible) {
@@ -193,6 +230,7 @@ struct MapScreen: View {
                     Picker("Genauigkeitskreise", selection: Binding(get: { model.circleMode }, set: { model.circleMode = $0 })) {
                         ForEach(CircleMode.allCases) { Text("Kreise: \($0.label)").tag($0) }
                     }
+                    Toggle("Apple-Geräte anzeigen", isOn: Binding(get: { model.showAppleOnMap }, set: { model.showAppleOnMap = $0; Haptics.light() }))
                     Toggle("Aufenthalte anzeigen", isOn: Binding(get: { model.showStays }, set: { model.showStays = $0; Haptics.light() }))
                 } label: {
                     Image(systemName: style == .standard ? "map" : "map.fill")
@@ -217,6 +255,7 @@ struct MapScreen: View {
                     Haptics.light()
                     if model.historyVisible, !model.track.isEmpty { model.fitTrack() }
                     else if let id = model.focusedID, let r = model.device(id)?.last { model.show(center: r.coordinate, meters: 900) }
+                    else if let id = model.focusedAppleID, let b = model.appleDevice(id)?.best { model.show(center: b.coordinate, meters: 900) }
                     else { model.fitAll() }
                 } label: {
                     Image(systemName: "scope")
