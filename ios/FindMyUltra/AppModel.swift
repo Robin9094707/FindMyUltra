@@ -88,6 +88,38 @@ final class AppModel {
         didSet { UserDefaults.standard.set(showStays, forKey: "showStays") }
     }
     private var staysTask: Task<Void, Never>?
+
+    // „Seit dem letzten Öffnen“
+    var newSince: NewSince?
+    var sinceTs: Double? = UserDefaults.standard.object(forKey: "lastSeenTs") as? Double
+
+    /// Beim Wechsel in den Hintergrund: jetzt als „zuletzt gesehen“ merken.
+    func markBackground() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastSeenTs")
+    }
+
+    /// Beim Öffnen: Vergleichszeitpunkt = letztes Schließen.
+    func markOpened() {
+        sinceTs = UserDefaults.standard.object(forKey: "lastSeenTs") as? Double
+        Task { await loadNewSince() }
+    }
+
+    func markAllSeen() {
+        Haptics.light()
+        let t = Date().timeIntervalSince1970
+        UserDefaults.standard.set(t, forKey: "lastSeenTs")
+        sinceTs = t
+        withAnimation(.smooth) { newSince = nil }
+    }
+
+    func loadNewSince() async {
+        guard let api, let since = sinceTs else { return }
+        if let r: NewSince = try? await api.get("/api/new", query: [.init(name: "since", value: String(since))]) {
+            withAnimation(.smooth) { newSince = r }
+        }
+    }
+
+    func newCount(_ id: String) -> Int { newSince?.devices.first { $0.deviceId == id }?.n ?? 0 }
     var cameraRegion: MKCoordinateRegion?
     var cameraTick = 0
     var thoroughRefresh: Bool = UserDefaults.standard.object(forKey: "thoroughRefresh") as? Bool ?? true {
@@ -119,6 +151,7 @@ final class AppModel {
             try await loadAll()
             isConnected = true
             startLive()
+            await loadNewSince()
         } catch let e as APIError where e.isUnauthorized {
             isConnected = false
         } catch {
@@ -488,6 +521,9 @@ final class AppModel {
                     h.append(contentsOf: r.reports)
                     h.sort { $0.ts < $1.ts }
                     history[r.deviceId] = h
+                }
+                if sinceTs != nil {
+                    Task { await loadNewSince() }
                 }
                 if r.deviceId == focusedID {
                     let atEnd = cursor == nil || cursor == track.count - 1

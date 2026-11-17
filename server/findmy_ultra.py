@@ -2211,6 +2211,16 @@ def build_app(st: State) -> web.Application:
         return web.json_response({"reports": st.store.reports(
             _f(q.get("since")), _f(q.get("until")), req.match_info["id"], int(q.get("limit", 50000)))})
 
+    async def new_since(req: web.Request) -> web.Response:
+        """Neue Berichte je Objekt seit Zeitpunkt X (nach Eingang beim Server)."""
+        since = _f(req.query.get("since")) or (now() - 86400)
+        rows = st.store.db.execute(
+            "SELECT device_id, COUNT(*) AS n, MAX(ts) AS newest, SUM(late) AS late, "
+            "COUNT(DISTINCT CASE WHEN batch_size>1 AND batch_id NOT LIKE 'init-%' THEN batch_id END) AS batches "
+            "FROM reports WHERE received_at>? GROUP BY device_id", (since,)).fetchall()
+        items = [dict(r) for r in rows]
+        return web.json_response({"since": since, "total": sum(x["n"] for x in items), "devices": items})
+
     async def device_stays(req: web.Request) -> web.Response:
         q = req.query
         cfg = dict(st.store.settings().get("stays", {}))
@@ -2364,6 +2374,7 @@ def build_app(st: State) -> web.Application:
     r.add_delete("/api/devices/{id}", device_delete)
     r.add_get("/api/devices/{id}/reports", device_reports)
     r.add_get("/api/devices/{id}/stays", device_stays)
+    r.add_get("/api/new", new_since)
     r.add_get("/api/devices/{id}/keys", device_export_keys)
     r.add_get("/api/reports", all_reports)
     r.add_post("/api/import", import_keys)

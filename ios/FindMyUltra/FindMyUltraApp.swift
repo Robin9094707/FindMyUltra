@@ -42,9 +42,11 @@ struct FindMyUltraApp: App {
                     case .active:
                         if model.isConnected {
                             model.startLive()
+                            model.markOpened()
                             Task { try? await model.loadAll() }
                         }
                     case .background:
+                        model.markBackground()
                         model.stopLive()
                     default: break
                     }

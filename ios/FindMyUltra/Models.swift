@@ -186,6 +186,19 @@ struct Place: Codable, Identifiable, Hashable {
     var coordinate: CLLocationCoordinate2D { .init(latitude: lat, longitude: lon) }
 }
 
+struct NewSince: Codable, Hashable {
+    struct Item: Codable, Hashable {
+        var deviceId: String
+        var n: Int
+        var newest: Double?
+        var late: Int?
+        var batches: Int?
+    }
+    var since: Double
+    var total: Int
+    var devices: [Item]
+}
+
 struct StaysResponse: Codable {
     var stays: [Stay]
     var places: [Place]

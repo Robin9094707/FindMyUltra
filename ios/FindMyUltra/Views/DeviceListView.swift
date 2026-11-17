@@ -7,6 +7,12 @@ struct DeviceListView: View {
 
     var body: some View {
         List {
+            if let ns = model.newSince, ns.total > 0 {
+                Section {
+                    NewSinceCard(info: ns)
+                        .listRowBackground(Color.yellow.opacity(0.12))
+                }
+            }
             Section {
                 ForEach(model.devices) { d in
                     Button {
@@ -105,6 +111,8 @@ struct DeviceRow: View {
                     if device.lost.enabled { tag("VERLOREN", .red) }
                     if device.isGuarded { tag("WACHE", .orange) }
                     if !device.enabled { tag("PAUSE", .gray) }
+                    let n = model.newCount(device.id)
+                    if n > 0 { tag("+\(n) NEU", .purple) }
                 }
                 if let r = device.last {
                     HStack(spacing: 0) {
@@ -172,5 +180,63 @@ enum KeyImporter {
             Haptics.warning()
             return "❌ \(error.localizedDescription)"
         }
+    }
+}
+
+/// Aufklappbare Info: neue Standorte seit dem letzten Öffnen der App.
+struct NewSinceCard: View {
+    @Environment(AppModel.self) private var model
+    let info: NewSince
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded.animation(.spring(duration: 0.35))) {
+            VStack(spacing: 8) {
+                ForEach(info.devices.sorted { $0.n > $1.n }, id: \.deviceId) { item in
+                    if let d = model.device(item.deviceId) {
+                        Button { model.openDevice(d.id) } label: {
+                            HStack(spacing: 10) {
+                                EmojiBadge(device: d, size: 32)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(d.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                                    HStack(spacing: 4) {
+                                        if let t = item.newest { AgeText(date: Date(timeIntervalSince1970: t)) }
+                                        if (item.batches ?? 0) > 0 { Text("· \(item.batches ?? 0) Batch").foregroundStyle(.secondary) }
+                                        if (item.late ?? 0) > 0 { Text("· \(item.late ?? 0) nachgereicht").foregroundStyle(.secondary) }
+                                    }
+                                    .font(.caption)
+                                }
+                                Spacer()
+                                Text("+\(item.n)")
+                                    .font(.subheadline.bold().monospacedDigit())
+                                    .padding(.horizontal, 10).padding(.vertical, 4)
+                                    .background(Color.purple.opacity(0.18), in: .capsule)
+                                    .foregroundStyle(.purple)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Button("Als gesehen markieren") { model.markAllSeen() }
+                    .buttonStyle(.glass)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.top, 4)
+            }
+            .padding(.top, 8)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.headline).foregroundStyle(.black)
+                    .frame(width: 32, height: 32).background(Color.yellow, in: .circle)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(info.total) neue Standorte").font(.headline)
+                    Text("seit \(findMyTime(Date(timeIntervalSince1970: info.since)).text.replacingOccurrences(of: "Vor", with: "vor")) · \(info.devices.count) Objekt(e)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .tint(.primary)
+        .onChange(of: expanded) { _, _ in Haptics.light() }
     }
 }
