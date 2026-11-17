@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1352,12 +1352,23 @@ class OnlineDevices:
                                        headers={"User-Agent": f"FindMyUltra/{VERSION}"})
         return self.http4
 
+    @staticmethod
+    def _apple_ssl() -> Any:
+        """Gleicher Trust-Store wie FindMy.py: System-CAs + Apples eigene Root-CA
+        (fehlt in vielen Linux-/certifi-Speichern → „unable to get local issuer certificate“)."""
+        try:
+            from findmy.util.tls import apple_trust_context
+            return apple_trust_context()
+        except Exception:  # noqa: BLE001  (ältere FindMy.py-Version)
+            return True
+
     async def _post_with(self, s: ClientSession, path: str, body: dict, headers: dict,
                          dsid: str, tok: str) -> dict:
         import aiohttp
         for _ in range(3):
             url = f"https://{self.host}/fmipservice/device/{dsid}/{path}"
-            async with s.post(url, json=body, headers=headers, auth=aiohttp.BasicAuth(dsid, tok)) as r:
+            async with s.post(url, json=body, headers=headers, auth=aiohttp.BasicAuth(dsid, tok),
+                              ssl=self._apple_ssl()) as r:
                 if r.status == 330 and r.headers.get("X-Apple-MMe-Host"):
                     self.host = r.headers["X-Apple-MMe-Host"]
                     continue
@@ -1425,6 +1436,9 @@ class OnlineDevices:
     @staticmethod
     def _friendly(e: Exception) -> str:
         import aiohttp
+        if isinstance(e, aiohttp.ClientConnectorCertificateError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
+            return ("Zertifikat von iCloud wurde nicht akzeptiert. Prüft deine Firewall HTTPS "
+                    "(TLS-Inspektion)? Dann fmipmobile.icloud.com / *.icloud.com davon ausnehmen.")
         if isinstance(e, aiohttp.ClientConnectorError):
             return ("Der Server erreicht iCloud („Wo ist?“) nicht – Netzwerk/Firewall/DNS prüfen. "
                     "(IPv4 wurde bereits versucht.)")
