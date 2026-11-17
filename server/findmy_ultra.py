@@ -117,7 +117,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1307,23 +1307,69 @@ class OnlineDevices:
         return {"enabled": bool(cfg.get("enabled")), "interval": cfg.get("interval"),
                 "error": self.error, "last_refresh": self.last_refresh}
 
-    def _auth(self) -> tuple[str, str]:
+    def _creds(self, scheme: str) -> tuple[str, str, str]:
+        """Liefert (Pfad-ID, Benutzer, Geheimnis) für das Auth-Schema."""
         acc = self.st.apple.account
+        if scheme == "UserIdGuest":
+            user, pw = getattr(acc, "_username", None), getattr(acc, "_password", None)
+            if not user or not pw:
+                raise PermissionError("Keine Apple-ID/Passwort in der Sitzung gespeichert.")
+            return user, user, pw
         data = getattr(acc, "_login_state_data", {}) or {}
         dsid = str(data.get("dsid") or "")
         tokens = (data.get("mobileme_data") or {}).get("tokens") or {}
-        tok = tokens.get("mmeFMIPToken") or tokens.get("mmeFMIPAppToken")
+        tok = tokens.get("mmeFMIPToken") or tokens.get("mmeFMIPAppToken") or tokens.get("mmeAuthToken")
         if not dsid or not tok:
-            raise RuntimeError("Kein FMIP-Token in der Apple-Sitzung – bitte Apple-Account neu anmelden.")
-        return dsid, tok
+            raise PermissionError("Kein FMIP-Token in der Apple-Sitzung.")
+        return dsid, dsid, tok
+
+    async def _refresh_tokens(self) -> None:
+        """Tokens korrekt erneuern (LOGGED_IN → AUTHENTICATED → LOGGED_IN), wie FindMy.py bei 401."""
+        from findmy import LoginState
+        acc = self.st.apple.account
+        async with self.st.apple.lock:
+            state = await acc._gsa_authenticate()
+            if state != LoginState.AUTHENTICATED:
+                raise PermissionError(f"Token-Erneuerung nicht möglich (Status {state}).")
+            await acc._login_mobileme()
+            self.st.apple.save()
 
     async def _post(self, path: str, body: dict) -> dict:
+        """Probiert die Anmeldearten nacheinander und merkt sich die funktionierende."""
+        preferred = self.st.store.kv_get("fmip_scheme") or "Forever"
+        order = [preferred] + [x for x in ("Forever", "UserIdGuest") if x != preferred]
+        last: Exception | None = None
+        refreshed = False
+        for scheme in order:
+            for attempt in range(2):
+                try:
+                    res = await self._post_scheme(scheme, path, body)
+                    if scheme != preferred:
+                        self.st.store.kv_set("fmip_scheme", scheme)
+                        log.info("Online-Ortung: Anmeldeart „%s“ funktioniert.", scheme)
+                    return res
+                except PermissionError as e:
+                    last = e
+                    log.info("Online-Ortung: %s abgelehnt (%s).", scheme, e)
+                    if scheme == "Forever" and attempt == 0 and not refreshed:
+                        refreshed = True
+                        try:
+                            await self._refresh_tokens()
+                            continue
+                        except Exception as re_:  # noqa: BLE001
+                            log.info("Token-Erneuerung fehlgeschlagen: %s", re_)
+                    break
+        raise last or PermissionError("Online-Abfrage abgelehnt")
+
+    async def _post_scheme(self, scheme: str, path: str, body: dict) -> dict:
         import aiohttp
-        dsid, tok = self._auth()
+        pid, user, secret = self._creds(scheme)
+        dsid, tok = pid, secret
         headers = {
             "X-Apple-Realm-Support": "1.0",
             "X-Apple-Find-Api-Ver": "3.0",
-            "X-Apple-AuthScheme": "Forever",
+            "X-Apple-AuthScheme": scheme,
+            "Authorization": "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode(),
             "User-Agent": "FindMyiPhone/500 CFNetwork/1568.100.1 Darwin/24.0.0",
             "Accept-Language": "de-DE",
             "Content-Type": "application/json",
@@ -1367,13 +1413,14 @@ class OnlineDevices:
         import aiohttp
         for _ in range(3):
             url = f"https://{self.host}/fmipservice/device/{dsid}/{path}"
-            async with s.post(url, json=body, headers=headers, auth=aiohttp.BasicAuth(dsid, tok),
-                              ssl=self._apple_ssl()) as r:
+            async with s.post(url, json=body, headers=headers, ssl=self._apple_ssl()) as r:
                 if r.status == 330 and r.headers.get("X-Apple-MMe-Host"):
                     self.host = r.headers["X-Apple-MMe-Host"]
                     continue
                 if r.status in (401, 403):
-                    raise PermissionError(f"Apple hat die Online-Abfrage abgelehnt ({r.status}).")
+                    detail = (await r.text())[:120].strip()
+                    raise PermissionError(f"Apple hat die Online-Abfrage abgelehnt ({r.status}"
+                                          f"{', ' + detail if detail else ''}).")
                 if r.status >= 400:
                     raise RuntimeError(f"FMIP-Fehler {r.status}: {(await r.text())[:200]}")
                 return await r.json(content_type=None)
@@ -1412,13 +1459,7 @@ class OnlineDevices:
             return 0
         async with self.lock:
             try:
-                try:
-                    j = await self._post("initClient", self._context())
-                except PermissionError:
-                    # Token auffrischen und einmal erneut versuchen
-                    await self.st.apple.account._login_mobileme()
-                    self.st.apple.save()
-                    j = await self._post("initClient", self._context())
+                j = await self._post("initClient", self._context())
                 items = [self._parse(d) for d in (j.get("content") or []) if d.get("id")]
                 for it in items:
                     self.st.store.apple_upsert_fmip(it)
