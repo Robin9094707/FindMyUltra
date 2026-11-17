@@ -1,0 +1,84 @@
+name: iOS IPA
+
+on:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Neuestes Xcode 26 wählen
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)
+          [ -z "$XC" ] && XC=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          echo "Nutze $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: XcodeGen installieren
+        run: brew install xcodegen
+
+      - name: Projekt erzeugen
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Bauen
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project FindMyUltra.xcodeproj \
+            -scheme FindMyUltra \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | xcbeautify --renderer github-actions || {
+              echo "::group::Fehler"; grep -E "error:" build.log | sort -u | head -80; echo "::endgroup::"; exit 1; }
+
+      - name: IPA packen
+        working-directory: ios
+        run: |
+          APP=build/Build/Products/Release-iphoneos/FindMyUltra.app
+          test -d "$APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry FindMyUltra.ipa Payload
+          ls -lh FindMyUltra.ipa
+
+      - name: IPA hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: FindMyUltra-ipa
+          path: ios/FindMyUltra.ipa
+          if-no-files-found: error
+
+      - name: Build-Log bei Fehler
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ios/build.log
+          if-no-files-found: ignore
+
+      - name: Release (bei Tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ios/FindMyUltra.ipa

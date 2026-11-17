@@ -1,0 +1,69 @@
+name: FindMyUltra
+options:
+  bundleIdPrefix: de.findmyultra
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+targets:
+  FindMyUltra:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: FindMyUltra
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.findmyultra.app
+        PRODUCT_NAME: FindMyUltra
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_FILE: FindMyUltra/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: NO
+    info:
+      path: FindMyUltra/Info.plist
+      properties:
+        CFBundleDisplayName: FindMy Ultra
+        CFBundleName: FindMyUltra
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDevelopmentRegion: de
+        LSRequiresIPhoneOS: true
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: FindMy Ultra verbindet sich mit deinem Server im lokalen Netzwerk.
+        NSLocationWhenInUseUsageDescription: Zeigt deinen eigenen Standort auf der Karte neben deinen Objekten.
+        CFBundleURLTypes:
+          - CFBundleURLName: de.findmyultra.app
+            CFBundleURLSchemes:
+              - findmyultra

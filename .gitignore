@@ -1,0 +1,13 @@
+# Server-Daten (enthalten Schlüssel, Sitzungen, Passwörter!)
+server/data/
+server/.venv/
+data/
+*.sqlite3*
+__pycache__/
+# iOS
+ios/FindMyUltra.xcodeproj/
+ios/build/
+ios/Payload/
+*.ipa
+.DS_Store
+ios/FindMyUltra/Info.plist
