@@ -258,10 +258,10 @@ enum BatteryLevel {
     }
     static func color(_ s: String?) -> Color {
         switch s {
-        case "low": .orange
-        case "critical": .red
-        case nil: .secondary
-        default: .green
+        case "full": .green
+        case "medium": .yellow
+        case "low", "critical": .red
+        default: .secondary
         }
     }
 }

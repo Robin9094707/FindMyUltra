@@ -112,11 +112,10 @@ struct DeviceDetailView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(d.name).font(.title.bold()).lineLimit(2)
                 if let r = d.last {
-                    let t = findMyTime(r.date)
                     Text(address ?? String(format: "%.5f, %.5f", r.lat, r.lon))
                         .font(.body).foregroundStyle(.secondary).lineLimit(1)
                     HStack(spacing: 6) {
-                        Text(t.text).foregroundStyle(t.old ? Color.red : Color.secondary)
+                        AgeText(date: r.date).fontWeight(.medium)
                         Text("·").foregroundStyle(.secondary)
                         Text("±\(r.accuracy ?? 0) m").foregroundStyle(.secondary)
                         if d.battery != nil {

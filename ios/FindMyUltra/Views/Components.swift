@@ -50,6 +50,27 @@ func findMyTime(_ date: Date) -> (text: String, old: Bool) {
     return (text, s > 6 * 3600)
 }
 
+/// Farbe der Zeitangabe: < 1 min lila, < 15 min grün, < 1 h gelb, älter rot.
+func ageColor(_ date: Date) -> Color {
+    let s = -date.timeIntervalSinceNow
+    if s < 60 { return .purple }
+    if s < 15 * 60 { return .green }
+    if s < 3600 { return .yellow }
+    return .red
+}
+
+/// Zeitangabe, die sich jede Sekunde selbst aktualisiert (Text + Farbe).
+struct AgeText: View {
+    let date: Date
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            Text(findMyTime(date).text)
+                .foregroundStyle(ageColor(date))
+                .contentTransition(.numericText())
+        }
+    }
+}
+
 // MARK: - Objekt-Symbol
 
 struct DeviceGlyph: View {

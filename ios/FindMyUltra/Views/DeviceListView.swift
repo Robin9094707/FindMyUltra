@@ -107,12 +107,11 @@ struct DeviceRow: View {
                     if !device.enabled { tag("PAUSE", .gray) }
                 }
                 if let r = device.last {
-                    let t = findMyTime(r.date)
                     HStack(spacing: 0) {
                         Text(address ?? "Standort wird ermittelt …")
                             .foregroundStyle(.secondary)
-                        Text(" · ").foregroundStyle(.secondary)
-                        Text(t.text).foregroundStyle(t.old ? Color.red : Color.secondary)
+                        Text(" · ").foregroundStyle(.secondary).layoutPriority(1)
+                        AgeText(date: r.date).fontWeight(.medium).layoutPriority(2)
                     }
                     .font(.subheadline)
                     .lineLimit(1)
