@@ -74,7 +74,7 @@ struct MapScreen: View {
                 }
             }
             .onChange(of: model.cursor) { _, _ in
-                guard model.followCursor, let r = model.cursorReport else { return }
+                guard model.historyVisible, model.followCursor, let r = model.cursorReport else { return }
                 model.show(center: r.coordinate, meters: max(500, Double(r.accuracy ?? 0) * 8))
             }
             .onChange(of: model.detent) { _, _ in Haptics.light() }
@@ -104,13 +104,15 @@ struct MapScreen: View {
                     .stroke(.blue.opacity(0.45), lineWidth: 1)
             }
 
-            if let d = focused {
-                // Wache-Radius
-                if d.isGuarded, let gl = d.alerts.guardMode.lat, let gn = d.alerts.guardMode.lon {
-                    MapCircle(center: .init(latitude: gl, longitude: gn), radius: d.alerts.guardMode.radiusM)
-                        .foregroundStyle(.orange.opacity(0.08))
-                        .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
-                }
+            // Wache-Radius
+            if let d = focused, d.isGuarded, let gl = d.alerts.guardMode.lat, let gn = d.alerts.guardMode.lon {
+                MapCircle(center: .init(latitude: gl, longitude: gn), radius: d.alerts.guardMode.radiusM)
+                    .foregroundStyle(.orange.opacity(0.08))
+                    .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+            }
+
+            // Verlauf nur, wenn eingeblendet
+            if let d = focused, model.historyVisible {
                 // Aufenthalte (gelb)
                 if model.showStays {
                     ForEach(model.stays) { st in
@@ -161,7 +163,7 @@ struct MapScreen: View {
 
             // Objekte (AirTag-Pins)
             ForEach(pins) { p in
-                if model.circleMode != .off && p.device.id != model.focusedID {
+                if model.circleMode != .off && (p.device.id != model.focusedID || !model.historyVisible) {
                     MapCircle(center: p.report.coordinate, radius: CLLocationDistance(max(p.report.accuracy ?? 5, 5)))
                         .foregroundStyle(Color.blue.opacity(0.1))
                         .stroke(Color.blue.opacity(0.45), lineWidth: 1)
@@ -213,7 +215,9 @@ struct MapScreen: View {
                 Divider().frame(width: 28)
                 Button {
                     Haptics.light()
-                    if model.focusedID != nil, !model.track.isEmpty { model.fitTrack() } else { model.fitAll() }
+                    if model.historyVisible, !model.track.isEmpty { model.fitTrack() }
+                    else if let id = model.focusedID, let r = model.device(id)?.last { model.show(center: r.coordinate, meters: 900) }
+                    else { model.fitAll() }
                 } label: {
                     Image(systemName: "scope")
                         .frame(width: 46, height: 44)

@@ -73,7 +73,9 @@ final class AppModel {
 
     // Karte & Verlauf des fokussierten Objekts
     var focusedID: String?
-    var historyRange: HistoryRange = .d7
+    var historyRange: HistoryRange = .h24
+    /// Verlauf erst auf Knopfdruck zeigen – standardmäßig nur der aktuelle Standort.
+    var historyVisible = false
     var track: [Report] = []
     var cursor: Int?
     var circleMode: CircleMode = CircleMode(rawValue: UserDefaults.standard.string(forKey: "circleMode") ?? "") ?? .selected {
@@ -337,10 +339,25 @@ final class AppModel {
             focusedID = id
             track = []
             cursor = nil
+            historyVisible = false
+            historyRange = .h24
         }
         if let r = device(id)?.last { show(center: r.coordinate, meters: 900) }
         await reloadTrack(id, keepCursor: false)
-        fitTrack()
+        if historyVisible { fitTrack() }
+    }
+
+    func setHistoryVisible(_ on: Bool) {
+        Haptics.soft()
+        withAnimation(.smooth(duration: 0.4)) { historyVisible = on }
+        if on {
+            if cursor == nil, !track.isEmpty { cursor = track.count - 1 }
+            fitTrack()
+        } else if let id = focusedID, let r = device(id)?.last {
+            selectedStayID = nil
+            cursor = track.isEmpty ? nil : track.count - 1
+            show(center: r.coordinate, meters: 900)
+        }
     }
 
     func clearFocus() {
@@ -348,6 +365,7 @@ final class AppModel {
         track = []
         cursor = nil
         stays = []; places = []; totalStayTime = 0; selectedStayID = nil
+        historyVisible = false
     }
 
     /// Aufenthalte neu berechnen lassen (leicht verzögert, damit Live-Batches gesammelt werden).

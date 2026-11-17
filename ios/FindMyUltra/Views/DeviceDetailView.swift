@@ -32,7 +32,7 @@ struct DeviceDetailView: View {
         .onChange(of: model.historyRange) { _, _ in
             Task {
                 await model.reloadTrack(deviceID, keepCursor: false)
-                model.fitTrack()
+                if model.historyVisible { model.fitTrack() }
             }
         }
         .task(id: device?.last?.id) {
@@ -89,11 +89,18 @@ struct DeviceDetailView: View {
                 header(d)
                 if d.lost.enabled { lostBanner(d) }
                 actions(d)
-                historyCard(d)
-                StaysCard()
-                if let r = model.cursorReport { pointCard(r, d) }
+                if model.historyVisible {
+                    historyCard(d)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    StaysCard()
+                        .transition(.opacity)
+                    if let r = model.cursorReport { pointCard(r, d) }
+                } else {
+                    historyButton(d)
+                        .transition(.opacity)
+                }
                 infoCard(d)
-                pointList(d)
+                if model.historyVisible { pointList(d) }
                 Button(role: .destructive) { confirmDelete = true } label: {
                     Label("Objekt entfernen", systemImage: "trash").frame(maxWidth: .infinity)
                 }
@@ -223,6 +230,32 @@ struct DeviceDetailView: View {
 
     // MARK: Verlauf
 
+    /// Kompakter Knopf: Verlauf einblenden (Standard: letzte 24 h).
+    private func historyButton(_ d: Device) -> some View {
+        Button { model.setHistoryVisible(true) } label: {
+            HStack(spacing: 14) {
+                Image(systemName: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 42, height: 42)
+                    .background(d.tint.gradient, in: .circle)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Standortverlauf einblenden").font(.headline).foregroundStyle(.primary)
+                    Text(model.track.isEmpty
+                         ? "Letzte \(model.historyRange.label) · keine Punkte"
+                         : "Letzte \(model.historyRange.label) · \(model.track.count) Punkte\(model.stays.isEmpty ? "" : " · \(model.stays.count) Aufenthalte")")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.down").font(.footnote.bold()).foregroundStyle(.tertiary)
+            }
+            .padding(14)
+            .background(Color(.secondarySystemGroupedBackground).opacity(0.7), in: .rect(cornerRadius: 22))
+            .contentShape(.rect(cornerRadius: 22))
+        }
+        .buttonStyle(PressableStyle())
+    }
+
     private func historyCard(_ d: Device) -> some View {
         @Bindable var model = model
         let count = model.track.count
@@ -231,6 +264,12 @@ struct DeviceDetailView: View {
                 Label("Standortverlauf", systemImage: "clock.arrow.circlepath").font(.headline)
                 Spacer()
                 Text("\(count) Punkte").font(.subheadline).foregroundStyle(.secondary)
+                Button { model.setHistoryVisible(false) } label: {
+                    Image(systemName: "chevron.up").font(.footnote.bold()).frame(width: 30, height: 30)
+                        .background(Color(.tertiarySystemFill), in: .circle)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Verlauf ausblenden")
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
