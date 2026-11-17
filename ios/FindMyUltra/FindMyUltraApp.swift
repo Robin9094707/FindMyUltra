@@ -2,7 +2,7 @@ import SwiftUI
 import UserNotifications
 
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-    var onOpen: ((URL) -> Void)?
+    var onOpen: (@MainActor (URL) -> Void)?
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
@@ -12,7 +12,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         if let s = response.notification.request.content.userInfo["url"] as? String, let u = URL(string: s) {
-            DispatchQueue.main.async { self.onOpen?(u) }
+            Task { @MainActor in self.onOpen?(u) }
         }
         completionHandler()
     }
