@@ -7,6 +7,10 @@ on:
       - ".github/workflows/server.yml"
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
   workflow_dispatch:
 
 permissions:

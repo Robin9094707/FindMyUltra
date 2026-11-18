@@ -7,6 +7,10 @@ on:
       - ".github/workflows/ios.yml"
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
   workflow_dispatch:
 
 permissions:
