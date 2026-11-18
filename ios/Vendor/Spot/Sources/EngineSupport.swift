@@ -22,3 +22,11 @@ func deviceNotCurrentlyReachable(device: BluetoothTempData, currentDate: Date, t
     currentDate.timeIntervalSince(device.last_update_publisher) > Double(timeout)
 }
 
+
+
+/// FindMy Ultra: Prüft die im Info.plist angemeldeten Hintergrundmodi, bevor die Engine
+/// Hintergrund-APIs nutzt, die ohne Anmeldung zum sofortigen Beenden der App führen.
+enum SpotBackgroundModes {
+    static let modes: Set<String> = Set((Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]) ?? [])
+    static func has(_ mode: String) -> Bool { modes.contains(mode) }
+}

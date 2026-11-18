@@ -80,7 +80,7 @@ public struct GoogleReportSnapshot: Identifiable, Equatable {
     private init() {
         backgroundHistoryEnabled = preferences.bool(forKey: "native.backgroundHistoryEnabled")
         // A stored choice is kept; new installations refresh every 30 seconds in the foreground.
-        refreshInterval = Self.validInterval(preferences.object(forKey: "native.refreshInterval") as? Int ?? 30)
+        refreshInterval = Self.validInterval(preferences.object(forKey: "native.refreshInterval") as? Int ?? 120)
         contributorMode = preferences.string(forKey: "native.contributorMode") ?? "AtAllAreas"
         Settings.sharedInstance.contributorType = ContributorType(rawValue: contributorMode) ?? .AtAllAreas
     }

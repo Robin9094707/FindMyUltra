@@ -35,7 +35,7 @@ enum SheetSection: String, CaseIterable, Identifiable {
         }
     }
 }
-struct DeviceRoute: Hashable {
+struct DeviceRoute: Hashable, Codable {
     let id: String
     var apple: Bool = false
     var recording: Bool = false
@@ -159,11 +159,21 @@ final class AppModel {
     var addresses: [String: String] = [:]
 
     // UI (Sheet wie in „Wo ist?“)
-    var section: SheetSection = .items
-    var sheetPath: [DeviceRoute] = [] {
-        didSet { if sheetPath.isEmpty { clearFocus() } }
+    var section: SheetSection = SheetSection(rawValue: UserDefaults.standard.string(forKey: "section") ?? "") ?? .items {
+        didSet { UserDefaults.standard.set(section.rawValue, forKey: "section") }
     }
-    var detent: PresentationDetent = .medium
+    var sheetPath: [DeviceRoute] = AppModel.restoredPath() {
+        didSet {
+            if sheetPath.isEmpty { clearFocus() }
+            if let d = try? JSONEncoder().encode(sheetPath) { UserDefaults.standard.set(d, forKey: "sheetPath") }
+        }
+    }
+    var detent: PresentationDetent = AppModel.restoredDetent() {
+        didSet {
+            let s = detent == .peek ? "peek" : detent == .large ? "large" : "medium"
+            UserDefaults.standard.set(s, forKey: "detent")
+        }
+    }
     var isRefreshing = false
 
     // Karte & Verlauf des fokussierten Objekts
@@ -171,8 +181,17 @@ final class AppModel {
     var historyRange: HistoryRange = .h24
     /// Verlauf erst auf Knopfdruck zeigen – standardmäßig nur der aktuelle Standort.
     var historyVisible = false
-    var track: [Report] = []
-    var cursor: Int?
+    /// Verlaufspunkte – der Cursor wird immer im gültigen Bereich gehalten (sonst Absturz beim Zeichnen).
+    var track: [Report] = [] {
+        didSet { if let c = cursor, !track.indices.contains(c) { cursor = track.isEmpty ? nil : track.count - 1 } }
+    }
+    var cursor: Int? {
+        didSet {
+            if let c = cursor, !track.indices.contains(c) {
+                cursor = track.isEmpty ? nil : min(max(c, 0), track.count - 1)
+            }
+        }
+    }
     var circleMode: CircleMode = CircleMode(rawValue: UserDefaults.standard.string(forKey: "circleMode") ?? "") ?? .selected {
         didSet { UserDefaults.standard.set(circleMode.rawValue, forKey: "circleMode") }
     }
@@ -231,10 +250,56 @@ final class AppModel {
     private var liveTask: Task<Void, Never>?
     private let geocoder = CLGeocoder()
 
+    @ObservationIgnored private var lastFullLoad: Date = .distantPast
+    @ObservationIgnored private var snapshotTask: Task<Void, Never>?
+
     init() {
         if let url = APIClient.normalize(serverURLString), let token = Keychain.get("token") {
             api = APIClient(baseURL: url, token: token, pinnedFingerprint: UserDefaults.standard.string(forKey: "pin"))
+            // Letzten Stand sofort zeigen – kein Splash, wenn iOS die App im Hintergrund beendet hat.
+            if let snap = AppCache.load() {
+                devices = snap.devices
+                appleDevices = snap.appleDevices
+                onlineStatus = snap.onlineStatus
+                status = snap.status
+                settings = snap.settings
+                isConnected = true
+                isBooting = false
+            }
         }
+    }
+
+    private static func restoredPath() -> [DeviceRoute] {
+        guard let d = UserDefaults.standard.data(forKey: "sheetPath"),
+              let p = try? JSONDecoder().decode([DeviceRoute].self, from: d) else { return [] }
+        return Array(p.suffix(1))
+    }
+
+    private static func restoredDetent() -> PresentationDetent {
+        switch UserDefaults.standard.string(forKey: "detent") {
+        case "peek": .peek
+        case "large": .large
+        default: .medium
+        }
+    }
+
+    /// Daten für den nächsten Start zwischenspeichern (gebündelt, im Hintergrund).
+    func saveSnapshot() {
+        snapshotTask?.cancel()
+        snapshotTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard let self, !Task.isCancelled, self.api != nil else { return }
+            let snap = AppSnapshot(devices: devices, appleDevices: appleDevices, onlineStatus: onlineStatus,
+                                   status: status, settings: settings, savedAt: Date().timeIntervalSince1970)
+            Task.detached(priority: .utility) { AppCache.save(snap) }
+        }
+    }
+
+    /// Beim Zurückkehren in die App nur neu laden, wenn der letzte volle Abgleich etwas her ist.
+    func refreshOnActivate() async {
+        guard isConnected else { return }
+        if Date().timeIntervalSince(lastFullLoad) > 20 { try? await loadAll() }
+        else { await reloadDevices() }
     }
 
     var pinnedFingerprint: String? { UserDefaults.standard.string(forKey: "pin") }
@@ -307,7 +372,9 @@ final class AppModel {
         api = nil
         isConnected = false
         devices = []; status = nil; settings = nil; me = nil; notifications = []; history = [:]
+        appleDevices = []
         sheetPath = []
+        AppCache.clear()
     }
 
     // MARK: Laden
@@ -326,11 +393,16 @@ final class AppModel {
         me = mm
         notifications = nn.notifications
         await reloadAppleDevices()
+        lastFullLoad = .now
+        // Wiederhergestellte Ansicht prüfen: Objekt gibt es evtl. nicht mehr
+        if let r = sheetPath.last, !r.recording,
+           (r.apple ? appleDevice(r.id) == nil : device(r.id) == nil) { sheetPath = [] }
+        saveSnapshot()
     }
 
     func reloadDevices() async {
         guard let api else { return }
-        if let d: DevicesEnvelope = try? await api.get("/api/devices") { devices = d.devices }
+        if let d: DevicesEnvelope = try? await api.get("/api/devices") { devices = d.devices; saveSnapshot() }
     }
 
     func reloadStatus() async {
@@ -434,6 +506,7 @@ final class AppModel {
         if let r: AppleDevicesEnvelope = try? await api.get("/api/apple-devices") {
             appleDevices = r.devices
             onlineStatus = r.online
+            saveSnapshot()
         }
     }
 
@@ -629,8 +702,8 @@ final class AppModel {
     }
 
     func fitAll() {
-        var coords = visibleItems.compactMap(\.last).map(\.coordinate)
-        if showAppleOnMap && networkFilter.contains(.apple) { coords += appleDevices.compactMap(\.best).map(\.coordinate) }
+        var coords = mapItems.compactMap(\.last).map(\.coordinate)
+        coords += mapAppleDevices.compactMap(\.best).map(\.coordinate)
         if let r = region(fitting: coords, padding: 1.6) { show(region: r) }
     }
 

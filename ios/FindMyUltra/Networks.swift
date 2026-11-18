@@ -14,6 +14,13 @@ import SpotIntegration
 final class GoogleLink {
     static let shared = GoogleLink()
 
+    /// Google wurde auf diesem iPhone eingerichtet. Erst dann startet die Engine
+    /// (spart Speicher, Bluetooth und Netzwerk, wenn Google gar nicht genutzt wird).
+    static var inUse: Bool {
+        get { UserDefaults.standard.bool(forKey: "googleInUse") }
+        set { UserDefaults.standard.set(newValue, forKey: "googleInUse") }
+    }
+
     @ObservationIgnored weak var model: AppModel?
     @ObservationIgnored private var subscription: AnyCancellable?
     @ObservationIgnored private var pending: Task<Void, Never>?
@@ -42,14 +49,15 @@ final class GoogleLink {
 
     func attach(_ model: AppModel) {
         self.model = model
-        guard subscription == nil else { return }
+        guard subscription == nil, Self.inUse else { return }
         subscription = GoogleTrackerStore.shared.$trackers
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in Task { @MainActor in self?.schedule() } }
     }
 
     func start() async {
-        guard model?.networkEnabled(.google) ?? true else { return }
+        guard Self.inUse, model?.networkEnabled(.google) ?? true else { return }
+        if let model, subscription == nil { attach(model) }
         await store.restoreIfNeeded()
         schedule(1)
     }
@@ -144,7 +152,7 @@ final class GoogleLink {
     }
 
     func snapshot(for device: Device) -> GoogleTrackerSnapshot? {
-        guard device.net == .google, let ext = device.extId else { return nil }
+        guard Self.inUse, device.net == .google, let ext = device.extId else { return nil }
         return store.trackers.first { $0.id == ext }
     }
 }
@@ -162,6 +170,29 @@ extension AppModel {
 
     /// Objekte, die der Netz-Filter gerade zeigt.
     var visibleItems: [Device] { items.filter { networkFilter.contains($0.net) } }
+
+    /// Verlauf eines Objekts oder eine Aufzeichnung ist offen → auf der Karte nur diese Spur zeigen.
+    var isolating: Bool { historyVisible && (focusedID != nil || focusedRecordingID != nil) }
+
+    /// Objekt-Pins auf der Karte: Netz-Filter, ausgewähltes Objekt immer, im Verlauf nur dieses.
+    var mapItems: [Device] {
+        if isolating {
+            guard let id = focusedID, let d = device(id) else { return [] }
+            return [d]
+        }
+        var list = visibleItems
+        if let id = focusedID, let d = device(id), !list.contains(where: { $0.id == id }) { list.append(d) }
+        return list
+    }
+
+    /// Apple-Geräte auf der Karte: im Geräte-Tab immer, sonst wenn „Apple“ im Filter ist
+    /// (und „Apple-Geräte anzeigen“ an). Das ausgewählte Gerät ist immer sichtbar.
+    var mapAppleDevices: [AppleDevice] {
+        if isolating { return [] }
+        let located = appleDevices.filter { $0.best != nil }
+        if section == .devices || (showAppleOnMap && networkFilter.contains(.apple)) { return located }
+        return located.filter { $0.id == focusedAppleID }
+    }
 
     /// Netze, in denen es Objekte gibt (für die Filter-Leiste).
     var presentNetworks: [TrackerNetwork] {
@@ -183,7 +214,8 @@ extension AppModel {
 
     /// „Orten“ – je nach Netz: Google zuerst direkt auf dem iPhone, sonst über den Server.
     func locate(_ d: Device) async {
-        if d.net == .google, let ext = d.extId, GoogleTrackerStore.shared.hasDevice(ext) {
+        guard !isRefreshing else { return }
+        if d.net == .google, GoogleLink.inUse, let ext = d.extId, GoogleTrackerStore.shared.hasDevice(ext) {
             Haptics.soft()
             isRefreshing = true
             await GoogleTrackerStore.shared.refreshLocation(ext)

@@ -20,45 +20,26 @@ struct DeviceListView: View {
                         .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
                 }
             }
-            Section {
-                ForEach(model.visibleItems) { d in
-                    Button {
-                        model.openDevice(d.id)
-                    } label: {
-                        DeviceRow(device: d)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                    .swipeActions(edge: .trailing) {
-                        Button {
-                            Task { await model.locate(d) }
-                        } label: { Label("Orten", systemImage: "location.magnifyingglass") }
-                        .tint(.blue)
-                    }
-                    .contextMenu {
-                        Button { Task { await model.locate(d) } } label: {
-                            Label("Jetzt orten", systemImage: "location.magnifyingglass")
+            let groups = groupedItems
+            ForEach(groups, id: \.network) { g in
+                Section {
+                    ForEach(g.items) { d in row(d) }
+                } header: {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if groups.count > 1 {
+                            Image(systemName: g.network.symbol).foregroundStyle(g.network == .apple ? Color.primary : g.network.color)
+                            Text("\(g.network.label) · \(g.items.count)")
+                        } else {
+                            Text("Meine Objekte")
                         }
-                        Button {
-                            Haptics.light()
-                            Task { try? await model.patchDevice(d.id, ["enabled": !d.enabled]) }
-                        } label: {
-                            Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen",
-                                  systemImage: d.enabled ? "pause.circle" : "play.circle")
+                        Spacer()
+                        if g.network == groups.first?.network, let s = model.status {
+                            Text("\(s.stats.total) Standorte · \(s.stats.today) heute")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    .textCase(nil)
                 }
-            } header: {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Meine Objekte")
-                    Spacer()
-                    if let s = model.status {
-                        Text("\(s.stats.total) Standorte · \(s.stats.today) heute")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                .textCase(nil)
             }
 
             if model.items.isEmpty {
@@ -110,6 +91,48 @@ struct DeviceListView: View {
                 Task { importMessage = await KeyImporter.importFiles(urls, model: model) }
             } onCancel: { importing = false }
             .ignoresSafeArea()
+        }
+    }
+}
+
+extension DeviceListView {
+    struct NetworkGroup { let network: TrackerNetwork; let items: [Device] }
+
+    /// Bei mehreren sichtbaren Netzen nach Netz gruppiert, sonst eine Liste.
+    var groupedItems: [NetworkGroup] {
+        let items = model.visibleItems
+        guard !items.isEmpty else { return [] }
+        let nets = TrackerNetwork.allCases.filter { n in items.contains { $0.net == n } }
+        if nets.count <= 1 { return [NetworkGroup(network: nets.first ?? .apple, items: items)] }
+        return nets.map { n in NetworkGroup(network: n, items: items.filter { $0.net == n }) }
+    }
+
+    func row(_ d: Device) -> some View {
+        Button {
+            model.openDevice(d.id)
+        } label: {
+            DeviceRow(device: d)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+        .swipeActions(edge: .trailing) {
+            Button {
+                Task { await model.locate(d) }
+            } label: { Label("Orten", systemImage: "location.magnifyingglass") }
+            .tint(.blue)
+        }
+        .contextMenu {
+            Button { Task { await model.locate(d) } } label: {
+                Label("Jetzt orten", systemImage: "location.magnifyingglass")
+            }
+            Button {
+                Haptics.light()
+                Task { try? await model.patchDevice(d.id, ["enabled": !d.enabled]) }
+            } label: {
+                Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen",
+                      systemImage: d.enabled ? "pause.circle" : "play.circle")
+            }
         }
     }
 }

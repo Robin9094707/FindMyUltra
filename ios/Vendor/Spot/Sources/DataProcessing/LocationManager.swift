@@ -87,6 +87,9 @@ open class LocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
 
     /// Enables automatic update of location in the background
     func enableBackgroundLocationUpdate() {
+        // FindMy Ultra: Ohne Hintergrundmodus „location“ beendet iOS die App sofort
+        // (NSInternalInconsistencyException). Dann nur im Vordergrund arbeiten.
+        guard SpotBackgroundModes.has("location") else { return }
         // Enable background location updates
         locationManager?.allowsBackgroundLocationUpdates = true
 
@@ -96,6 +99,7 @@ open class LocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
 
     /// Disables automatic update of location in the background
     func disableBackgroundLocationUpdate() {
+        guard SpotBackgroundModes.has("location") else { return }
         // Enable background location updates
         locationManager?.allowsBackgroundLocationUpdates = false
 

@@ -44,14 +44,16 @@ struct FindMyUltraApp: App {
                         if model.isConnected {
                             model.startLive()
                             model.markOpened()
-                            Task { try? await model.loadAll() }
+                            Task { await model.refreshOnActivate() }
                         }
-                        GoogleTrackerStore.shared.sceneChanged(active: true)
+                        if GoogleLink.inUse { GoogleTrackerStore.shared.sceneChanged(active: true) }
                     case .background:
                         model.markBackground()
                         model.stopLive()
-                        GoogleTrackerStore.shared.sceneChanged(active: false)
-                        Task { await GoogleLink.shared.push() }
+                        if GoogleLink.inUse {
+                            GoogleTrackerStore.shared.sceneChanged(active: false)
+                            Task { await GoogleLink.shared.push() }
+                        }
                     default: break
                     }
                 }

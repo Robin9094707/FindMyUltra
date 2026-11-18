@@ -25,7 +25,7 @@ struct MapScreen: View {
     @State private var showStyleMenu = false
 
     private var pins: [Pin] {
-        model.visibleItems.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
+        model.mapItems.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
     }
 
     private var focused: Device? { model.focusedID.flatMap { model.device($0) } }
@@ -37,8 +37,8 @@ struct MapScreen: View {
         let step = max(1, t.count / 600)
         var idx = Set(stride(from: 0, to: t.count, by: step))
         idx.insert(t.count - 1)
-        if let c = model.cursor { idx.insert(c) }
-        return idx.sorted().map { ($0, t[$0]) }
+        if let c = model.cursor, t.indices.contains(c) { idx.insert(c) }
+        return idx.sorted().filter { t.indices.contains($0) }.map { ($0, t[$0]) }
     }
 
     var body: some View {
@@ -69,6 +69,13 @@ struct MapScreen: View {
                 fitIfNeeded()
             }
             .onChange(of: model.devices) { _, _ in fitIfNeeded() }
+            .onChange(of: model.section) { _, s in
+                // Geräte-Tab: Apple-Geräte sofort in den Blick nehmen
+                if s == .devices, model.sheetPath.isEmpty {
+                    let coords = model.mapAppleDevices.compactMap(\.best).map(\.coordinate)
+                    if let r = region(fitting: coords, padding: 1.6) { model.show(region: r) }
+                }
+            }
             .onChange(of: model.cameraTick) { _, _ in
                 if let r = model.cameraRegion {
                     withAnimation(.smooth(duration: 0.75)) { position = .region(r) }
@@ -164,8 +171,7 @@ struct MapScreen: View {
             }
 
             // Apple-Geräte (bester Standort: online oder offline)
-            if model.showAppleOnMap && model.isShown(.apple) {
-                ForEach(model.appleDevices.filter { $0.best != nil }) { a in
+                ForEach(model.mapAppleDevices) { a in
                     if let b = a.best {
                         if model.circleMode != .off {
                             MapCircle(center: b.coordinate, radius: CLLocationDistance(max(b.accuracy ?? 5, 5)))
@@ -179,9 +185,8 @@ struct MapScreen: View {
                         .annotationTitles(a.id == model.focusedAppleID ? .visible : .automatic)
                     }
                 }
-            }
             // AirPods/Teile des ausgewählten Geräts einzeln (links/rechts/Case/online)
-            if let a = model.focusedAppleID.flatMap({ model.appleDevice($0) }) {
+            if !model.isolating, let a = model.focusedAppleID.flatMap({ model.appleDevice($0) }) {
                 ForEach(a.parts.filter { $0.last != nil && !(a.best?.role == $0.role && a.best?.isOnline == false) }) { p in
                     if let l = p.last, let role = PartRole(rawValue: p.role) {
                         Annotation(role.short, coordinate: l.coordinate, anchor: .bottom) {

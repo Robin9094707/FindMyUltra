@@ -220,6 +220,8 @@ struct GoogleNetworkView: View {
             }
         } message: { Text("Die Server-Ortung stoppt. Objekte und Verlauf bleiben erhalten.") }
         .task {
+            GoogleLink.inUse = true
+            GoogleLink.shared.attach(model)
             await google.restoreIfNeeded()
             await model.reloadStatus()
         }

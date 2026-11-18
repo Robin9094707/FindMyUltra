@@ -73,7 +73,9 @@ open class BluetoothManager: NSObject, CBPeripheralDelegate, CBCentralManagerDel
     func startCentralManager() {
         bluetoothQueue.async { [self] in
             if centralManager == nil {
-                let manager = CBCentralManager(delegate: self, queue: bluetoothQueue, options: [CBCentralManagerOptionRestoreIdentifierKey: restoreID])
+                // FindMy Ultra: Wiederherstellung nur mit Hintergrundmodus „bluetooth-central“, sonst Absturz.
+                let options: [String: Any]? = SpotBackgroundModes.has("bluetooth-central") ? [CBCentralManagerOptionRestoreIdentifierKey: restoreID] : nil
+                let manager = CBCentralManager(delegate: self, queue: bluetoothQueue, options: options)
                 centralManager = manager
                 centralManagerDidUpdateState(manager)
             }

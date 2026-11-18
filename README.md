@@ -4,8 +4,8 @@ Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Ger
 
 | Teil | Was | Version |
 |---|---|---|
-| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.0 |
-| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.0 |
+| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.1 |
+| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.1 |
 
 > Das Projekt extrahiert keine Schlüssel. Du importierst deine vorhandenen JSON- oder plist-Schlüsseldateien.
 > Es nutzt inoffizielle Apple-Schnittstellen, die sich jederzeit ändern können. Verwende es nur für deine eigenen Geräte.
