@@ -160,6 +160,8 @@ Unter der Server-Adresse findest du Karte, Verlauf mit Zeitleiste, Apple-Login, 
 
 ## Google & Samsung (1.7)
 
+**Neu in 1.7.1:** Absturz beim Aktualisieren eines Google-Trackers behoben. Die App startet nach kurzem Wechsel nicht mehr bei null, sondern zeigt sofort den letzten Stand und die zuletzt geöffnete Ansicht. Im Geräte-Tab sind iPad, AirPods & Co. immer auf der Karte, unabhängig vom Netz-Filter. Ist ein Verlauf offen, zeigt die Karte nur diesen Tracker. Die Objektliste ist nach Netz gruppiert.
+
 Neben Apple gibt es jetzt zwei weitere **Ortungsnetze**. Alle Tracker landen als normale Objekte in der Datenbank: Karte, Verlauf, Aufenthalte, Alarme, Verloren-Modus, Wache und Export funktionieren für jedes Netz gleich. **Vorhandene Daten bleiben unverändert** – die Datenbank bekommt nur zwei neue Spalten (`network`, `ext_id`), bestehende Objekte gelten als „Apple“.
 
 **Netz-Filter:** In der Objektliste wählst du oben *Alle · Apple · Google · Samsung* (gedrückt halten = zusätzlich ein-/ausblenden). Auch im Karten-Menü (oben rechts) lassen sich die Netze einzeln zeigen. Pins von Google- und Samsung-Trackern tragen ein kleines G- bzw. S-Abzeichen. Unter **Ich → Netzwerke** lässt sich jedes Netz ganz ein- oder ausschalten.
