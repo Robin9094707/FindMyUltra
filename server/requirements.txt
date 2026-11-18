@@ -1,2 +1,4 @@
 findmy>=0.10.2
 aiohttp>=3.9.5,<4
+# optional, für die Online-Ortung der Apple-Geräte (wird bei Bedarf automatisch installiert)
+pyicloud>=2.0

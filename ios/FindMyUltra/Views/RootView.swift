@@ -11,17 +11,11 @@ struct RootView: View {
                 ConnectView()
                     .transition(.opacity)
             } else {
-                MainTabs()
+                MapScreen()
                     .transition(.opacity)
-            }
-            if let t = model.toast {
-                ToastView(text: t)
-                    .padding(.top, 54)
-                    .zIndex(10)
             }
         }
         .animation(.smooth, value: model.isConnected)
-        .animation(.spring(duration: 0.4), value: model.toast)
     }
 }
 
@@ -40,40 +34,88 @@ struct SplashView: View {
     }
 }
 
-struct MainTabs: View {
+/// Inhalt des dauerhaften Sheets – Objekte, Mitteilungen, Ich.
+struct FindSheet: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         @Bindable var model = model
-        TabView(selection: $model.tab) {
-            Tab("Karte", systemImage: "map.fill", value: AppTab.map) {
-                NavigationStack(path: $model.mapPath) {
-                    MapScreen()
-                        .navigationDestination(for: DeviceRoute.self) { DeviceDetailView(deviceID: $0.id) }
+        NavigationStack(path: $model.sheetPath) {
+            root
+                .toolbar(.hidden, for: .navigationBar)
+                .navigationDestination(for: DeviceRoute.self) { r in
+                    if r.recording, let sid = Int(r.id) { RecordingDetailView(recordingID: sid) }
+                    else if r.apple { AppleDeviceDetailView(deviceID: r.id) }
+                    else { DeviceDetailView(deviceID: r.id) }
                 }
-            }
-            Tab("Objekte", systemImage: "circle.grid.2x2.fill", value: AppTab.items) {
-                NavigationStack(path: $model.itemsPath) {
-                    DeviceListView()
-                        .navigationDestination(for: DeviceRoute.self) { DeviceDetailView(deviceID: $0.id) }
-                }
-            }
-            Tab("Mitteilungen", systemImage: "bell.badge.fill", value: AppTab.alerts) {
-                NavigationStack(path: $model.alertsPath) {
-                    NotificationsView()
-                        .navigationDestination(for: DeviceRoute.self) { DeviceDetailView(deviceID: $0.id) }
-                }
-            }
-            .badge(model.unreadAlerts)
-            Tab("Einstellungen", systemImage: "gearshape.fill", value: AppTab.settings) {
-                NavigationStack {
-                    SettingsView()
-                }
+        }
+        .overlay(alignment: .top) {
+            if let t = model.toast {
+                ToastView(text: t).padding(.top, 6)
             }
         }
-        .tabBarMinimizeBehavior(.onScrollDown)
-        .onChange(of: model.tab) { _, t in
-            if t == .alerts { model.unreadAlerts = 0 }
+        .animation(.spring(duration: 0.4), value: model.toast)
+    }
+
+    private var root: some View {
+        VStack(spacing: 0) {
+            SectionBar()
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 4)
+            Group {
+                switch model.section {
+                case .items: DeviceListView()
+                case .devices: DevicesTabView()
+                case .alerts: NotificationsView()
+                case .me: SettingsView()
+                }
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+    }
+}
+
+struct SectionBar: View {
+    @Environment(AppModel.self) private var model
+    @Namespace private var ns
+
+    var body: some View {
+        GlassEffectContainer(spacing: 6) {
+            HStack(spacing: 4) {
+                ForEach(SheetSection.allCases) { s in
+                    Button {
+                        guard model.section != s else { return }
+                        Haptics.selection()
+                        withAnimation(.spring(duration: 0.35)) { model.section = s }
+                        if s == .alerts { model.unreadAlerts = 0 }
+                        if model.detent == .peek { model.detent = .medium }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: s.icon)
+                            Text(s.short).lineLimit(1).minimumScaleFactor(0.8)
+                            if s == .alerts && model.unreadAlerts > 0 {
+                                Text("\(model.unreadAlerts)")
+                                    .font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 1)
+                                    .background(.red, in: .capsule).foregroundStyle(.white)
+                            }
+                        }
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(model.section == s ? Color.primary : Color.secondary)
+                        .padding(.vertical, 9)
+                        .frame(maxWidth: .infinity)
+                        .background {
+                            if model.section == s {
+                                Capsule().fill(Color(.tertiarySystemFill))
+                                    .matchedGeometryEffect(id: "sel", in: ns)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(4)
+            .glassEffect(.regular, in: .capsule)
         }
     }
 }

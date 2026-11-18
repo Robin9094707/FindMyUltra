@@ -33,6 +33,11 @@ struct SettingsView: View {
                 } label: {
                     Label("Schlüssel importieren (.json / .plist)", systemImage: "square.and.arrow.down.on.square")
                 }
+                Button {
+                    Task { await importFromClipboard() }
+                } label: {
+                    Label("JSON aus Zwischenablage einfügen", systemImage: "doc.on.clipboard")
+                }
                 if let importResult { Text(importResult).font(.footnote) }
             } header: {
                 Text("Apple & Objekte")
@@ -43,15 +48,24 @@ struct SettingsView: View {
             if draft != nil {
                 pollingSection
                 historySection
+                appleSection
+                staysSection
                 barkSection
                 zonesSection
             }
 
-            Section("App") {
+            Section {
+                Toggle("Gründlich aktualisieren", isOn: $model.thoroughRefresh)
+                    .onChange(of: model.thoroughRefresh) { _, _ in Haptics.light() }
                 Toggle("Mitteilungen in der App", isOn: $model.inAppNotifications)
+                    .onChange(of: model.inAppNotifications) { _, _ in Haptics.light() }
                 NavigationLink { SecurityView() } label: {
                     Label("Sicherheit (Passwort, 2FA, Passkeys)", systemImage: "lock.shield")
                 }
+            } header: {
+                Text("App")
+            } footer: {
+                Text("„Gründlich“: Jedes Aktualisieren startet Schnell-Abruf, 24-h- und 7-Tage-Scan gleichzeitig (gebündelt in einer Abfrage) – so landen auch nachgelieferte Standorte sofort im Verlauf.")
             }
 
             Section {
@@ -60,22 +74,47 @@ struct SettingsView: View {
                 Text("FindMy Ultra \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") · Server \(model.status?.version ?? "–")")
             }
         }
-        .navigationTitle("Einstellungen")
-        .toolbar {
+        .scrollContentBackground(.hidden)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack {
+                Text("Ich").font(.largeTitle.bold())
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+        }
+        .safeAreaInset(edge: .bottom) {
             if dirty {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Sichern") { Task { await save() } }.disabled(saving)
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Button("Verwerfen") { Haptics.light(); draft = model.settings }
+                            .buttonStyle(.glass)
+                        Button {
+                            Task { await save() }
+                        } label: {
+                            Text(saving ? "Sichere …" : "Änderungen sichern").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .disabled(saving)
+                    }
+                    .controlSize(.large)
                 }
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Verwerfen") { draft = model.settings }
-                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .animation(.spring(duration: 0.3), value: dirty)
         .onAppear { if draft == nil { draft = model.settings } }
         .onChange(of: model.settings) { old, new in if draft == nil || draft == old { draft = new } }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.json, .propertyList, .xmlPropertyList, .data],
-                      allowsMultipleSelection: true) { result in
-            Task { await handleImport(result) }
+        .sheet(isPresented: $importing) {
+            DocumentPicker { urls in
+                importing = false
+                Task { await handleImport(.success(urls)) }
+            } onCancel: {
+                importing = false
+            }
+            .ignoresSafeArea()
         }
         .confirmationDialog("Vom Server abmelden?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
             Button("Abmelden", role: .destructive) { Task { await model.logout() } }
@@ -193,6 +232,64 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var appleSection: some View {
+        let d = draftBinding
+        if d.wrappedValue.onlineDevices != nil {
+            let od = Binding<OnlineDevicesConfig>(get: { d.wrappedValue.onlineDevices! }, set: { d.wrappedValue.onlineDevices = $0 })
+            Section {
+                Toggle("Online-Ortung (iCloud)", isOn: od.enabled)
+                Picker("Abfrage alle", selection: od.interval) {
+                    ForEach([60, 120, 300, 600, 1800], id: \.self) { Text(secs($0)).tag($0) }
+                }
+                if let st = model.onlineStatus {
+                    HStack {
+                        Text("iCloud")
+                        Spacer()
+                        Text(st.isConnected ? (st.account ?? "verbunden") : "nicht verbunden")
+                            .foregroundStyle(st.isConnected ? Color.green : Color.secondary).lineLimit(1)
+                    }
+                    if st.isConnected {
+                        Button("iCloud-Verbindung trennen", role: .destructive) {
+                            Task {
+                                if let s: OnlineStatus = try? await model.api?.send("POST", "/api/icloud/disconnect") {
+                                    model.onlineStatus = s; Haptics.light()
+                                }
+                            }
+                        }
+                    }
+                }
+                if let e = model.onlineStatus?.error { Text(e).font(.footnote).foregroundStyle(.orange) }
+            } header: {
+                Text("Apple-Geräte")
+            } footer: {
+                Text("Optional: Fragt die Online-Standorte deiner iPhones, iPads, Macs, Watches und AirPods mit derselben Apple-Anmeldung ab. Offline-Standorte kommen zusätzlich über importierte Schlüsseldateien im Geräte-Tab. Kein Standortverlauf.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var staysSection: some View {
+        let d = draftBinding
+        if d.wrappedValue.stays != nil {
+            let st = Binding<StaysConfig>(get: { d.wrappedValue.stays! }, set: { d.wrappedValue.stays = $0 })
+            Section {
+                Stepper("Umkreis: \(Int(st.wrappedValue.radiusM)) m", value: st.radiusM, in: 30...1000, step: 10)
+                Stepper("Mindestdauer: \(Int(st.wrappedValue.minMinutes)) min", value: st.minMinutes, in: 1...240)
+                Stepper("Mind. Berichte: \(st.wrappedValue.minPoints)", value: st.minPoints, in: 1...20)
+                Stepper("Ausreißer tolerieren: \(st.wrappedValue.maxOutliers)", value: st.maxOutliers, in: 0...20)
+                Stepper("… innerhalb von \(Int(st.wrappedValue.outlierMinutes)) min", value: st.outlierMinutes, in: 5...240, step: 5)
+                Stepper("Zusammenfassen bis \(Int(st.wrappedValue.mergeMinutes)) min Lücke", value: st.mergeMinutes, in: 0...240, step: 5)
+                Stepper("Max. Funkstille: \(Int(st.wrappedValue.maxGapHours)) h", value: st.maxGapHours, in: 1...48)
+                Stepper("Ungenau ab: \(Int(st.wrappedValue.maxAccuracyM)) m", value: st.maxAccuracyM, in: 50...5000, step: 50)
+            } header: {
+                Text("Aufenthalte")
+            } footer: {
+                Text("Ein Aufenthalt ist ein Ort, an dem das Objekt mindestens die Mindestdauer im Umkreis war. Einzelne Ausreißer (falsche Ortungen) brechen ihn nicht ab, solange das Objekt danach wieder dort geortet wird. Ungenauere Berichte zählen nur, wenn sie in den Umkreis passen. Wird live aus allen Berichten berechnet.")
+            }
+        }
+    }
+
     private var zonesSection: some View {
         Section {
             ForEach(draftBinding.zones) { $z in
@@ -233,8 +330,10 @@ struct SettingsView: View {
         do {
             try await model.saveSettings(d)
             draft = model.settings
-            model.showToast("✅ Gesichert")
+            Haptics.success()
+            model.showToast("Gesichert")
         } catch {
+            Haptics.warning()
             model.showToast("⚠️ \(error.localizedDescription)")
         }
     }
@@ -249,24 +348,32 @@ struct SettingsView: View {
         }
     }
 
+    private func importFromClipboard() async {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            importResult = "❌ Zwischenablage ist leer – öffne die JSON-Datei, „Alles auswählen“ → „Kopieren“."
+            return
+        }
+        await upload([("zwischenablage.json", Data(text.utf8))])
+    }
+
+    private func upload(_ files: [(name: String, data: Data)]) async {
+        importResult = "Importiere \(files.count) Datei(en) …"
+        importResult = await KeyImporter.upload(files, model: model)
+    }
+
     private func handleImport(_ result: Result<[URL], Error>) async {
-        guard case .success(let urls) = result, let api = model.api else { return }
+        guard case .success(let urls) = result else { return }
         var files: [(name: String, data: Data)] = []
         for u in urls {
             let ok = u.startAccessingSecurityScopedResource()
             defer { if ok { u.stopAccessingSecurityScopedResource() } }
             if let d = try? Data(contentsOf: u) { files.append((u.lastPathComponent, d)) }
         }
-        guard !files.isEmpty else { return }
-        do {
-            let r = try await api.upload(files: files)
-            let added = (r.added ?? []).map { "✅ \($0.name)\($0.new ? "" : " (aktualisiert)")" }
-            let failed = (r.errors ?? []).map { "❌ \($0.file): \($0.error)" }
-            importResult = (added + failed).joined(separator: "\n")
-            await model.reloadDevices()
-        } catch {
-            importResult = "❌ \(error.localizedDescription)"
+        guard !files.isEmpty else {
+            importResult = "❌ Datei konnte nicht gelesen werden"
+            return
         }
+        await upload(files)
     }
 }
 

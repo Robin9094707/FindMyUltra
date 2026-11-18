@@ -3,52 +3,199 @@ import SwiftUI
 import MapKit
 import CoreImage.CIFilterBuiltins
 
-// MARK: - Marker
+// MARK: - Haptik
 
-struct DeviceMarker: View {
-    let device: Device
-    var selected: Bool = false
-    @State private var pulse = false
+@MainActor
+enum Haptics {
+    static func selection() { UISelectionFeedbackGenerator().selectionChanged() }
+    static func light() { UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.8) }
+    static func soft() { UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.9) }
+    static func rigid() { UIImpactFeedbackGenerator(style: .rigid).impactOccurred(intensity: 0.6) }
+    static func success() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+    static func warning() { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+}
 
-    var body: some View {
-        ZStack {
-            if device.lost.enabled || device.isGuarded {
-                Circle()
-                    .stroke(device.lost.enabled ? Color.red : Color.orange, lineWidth: 3)
-                    .frame(width: 54, height: 54)
-                    .scaleEffect(pulse ? 1.5 : 0.9)
-                    .opacity(pulse ? 0 : 0.9)
-                    .animation(.easeOut(duration: 1.6).repeatForever(autoreverses: false), value: pulse)
-                    .onAppear { pulse = true }
-            }
-            Text(device.symbol)
-                .font(.system(size: selected ? 26 : 21))
-                .frame(width: selected ? 52 : 42, height: selected ? 52 : 42)
-                .background(device.tint.gradient, in: .circle)
-                .overlay(Circle().stroke(.white, lineWidth: 3))
-                .shadow(color: .black.opacity(0.35), radius: 6, y: 3)
+// MARK: - Zeitraum
+
+enum HistoryRange: Double, CaseIterable, Identifiable {
+    case h1 = 3600, h6 = 21600, h24 = 86400, d3 = 259200, d7 = 604800, d30 = 2592000, all = 0
+    var id: Double { rawValue }
+    var label: String {
+        switch self {
+        case .h1: "1 h"
+        case .h6: "6 h"
+        case .h24: "24 h"
+        case .d3: "3 T"
+        case .d7: "7 T"
+        case .d30: "30 T"
+        case .all: "Alle"
         }
-        .animation(.spring(duration: 0.35), value: selected)
     }
 }
 
+// MARK: - Zeit wie in „Wo ist?“
+
+func findMyTime(_ date: Date) -> (text: String, old: Bool) {
+    let s = -date.timeIntervalSinceNow
+    let de = Locale(identifier: "de_DE")
+    let hm = date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).locale(de))
+    let cal = Calendar.current
+    let text: String
+    if s < 60 { text = "Gerade eben" }
+    else if s < 3600 { text = "Vor \(Int(s / 60)) Min." }
+    else if cal.isDateInToday(date) { text = "Heute um \(hm)" }
+    else if cal.isDateInYesterday(date) { text = "Gestern um \(hm)" }
+    else if s < 6 * 86400 { text = "\(date.formatted(.dateTime.weekday(.wide).locale(de))) um \(hm)" }
+    else { text = "\(date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits).locale(de))) um \(hm)" }
+    return (text, s > 6 * 3600)
+}
+
+/// Farbe der Zeitangabe: < 1 min lila, < 15 min grün, < 1 h gelb, älter rot.
+func ageColor(_ date: Date) -> Color {
+    let s = -date.timeIntervalSinceNow
+    if s < 60 { return .purple }
+    if s < 15 * 60 { return .green }
+    if s < 3600 { return .yellow }
+    return .red
+}
+
+/// Zeitangabe, die sich jede Sekunde selbst aktualisiert (Text + Farbe).
+struct AgeText: View {
+    let date: Date
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            Text(findMyTime(date).text)
+                .foregroundStyle(ageColor(date))
+                .contentTransition(.numericText())
+        }
+    }
+}
+
+// MARK: - Objekt-Symbol
+
+struct DeviceGlyph: View {
+    let device: Device
+    var size: CGFloat
+    var body: some View {
+        if let e = device.emoji, !e.isEmpty, e != "📍" {
+            Text(e).font(.system(size: size))
+        } else {
+            Image(systemName: "airtag.fill")
+                .font(.system(size: size * 0.85, weight: .regular))
+                .foregroundStyle(.white, Color(.systemGray3))
+        }
+    }
+}
+
+/// Runder Kreis mit Emoji, wie die Liste in „Wo ist?“.
 struct EmojiBadge: View {
     let device: Device
     var size: CGFloat = 46
     var body: some View {
-        Text(device.symbol)
-            .font(.system(size: size * 0.5))
+        DeviceGlyph(device: device, size: size * 0.52)
             .frame(width: size, height: size)
-            .background(device.tint.opacity(0.25).gradient, in: .circle)
+            .background(Color(.tertiarySystemFill), in: .circle)
             .overlay(alignment: .bottomTrailing) {
                 if device.lost.enabled {
                     Image(systemName: "exclamationmark.circle.fill")
-                        .font(.system(size: size * 0.32)).foregroundStyle(.white, .red)
+                        .font(.system(size: size * 0.34)).foregroundStyle(.white, .red)
+                        .background(Circle().fill(Color(.systemBackground)).padding(1))
                 } else if device.isGuarded {
-                    Image(systemName: "shield.lefthalf.filled")
-                        .font(.system(size: size * 0.3)).foregroundStyle(.orange)
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: size * 0.3)).foregroundStyle(.white, .orange)
                 }
             }
+    }
+}
+
+// MARK: - AirTag-Pin auf der Karte (wie „Wo ist?“)
+
+struct PinTail: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.minY))
+        p.addQuadCurve(to: CGPoint(x: r.midX, y: r.maxY), control: CGPoint(x: r.midX - r.width * 0.12, y: r.minY + r.height * 0.4))
+        p.addQuadCurve(to: CGPoint(x: r.maxX, y: r.minY), control: CGPoint(x: r.midX + r.width * 0.12, y: r.minY + r.height * 0.4))
+        p.closeSubpath()
+        return p
+    }
+}
+
+struct AirTagPin: View {
+    let device: Device
+    var selected: Bool = false
+    var stale: Bool = false
+    @State private var pulse = false
+
+    var body: some View {
+        let bubble: CGFloat = selected ? 62 : 50
+        VStack(spacing: 0) {
+            ZStack {
+                if device.lost.enabled || device.isGuarded {
+                    Circle()
+                        .stroke(device.lost.enabled ? Color.red : Color.orange, lineWidth: 3)
+                        .frame(width: bubble, height: bubble)
+                        .scaleEffect(pulse ? 1.6 : 1)
+                        .opacity(pulse ? 0 : 0.9)
+                        .animation(.easeOut(duration: 1.6).repeatForever(autoreverses: false), value: pulse)
+                        .onAppear { pulse = true }
+                }
+                Circle()
+                    .fill(Color(.secondarySystemGroupedBackground))
+                    .frame(width: bubble, height: bubble)
+                    .overlay(Circle().stroke(device.lost.enabled ? Color.red : Color.white.opacity(0.12), lineWidth: device.lost.enabled ? 3 : 1))
+                DeviceGlyph(device: device, size: bubble * 0.5)
+                    .opacity(stale ? 0.75 : 1)
+            }
+            PinTail()
+                .fill(Color(.secondarySystemGroupedBackground))
+                .frame(width: 16, height: 10)
+                .offset(y: -1.5)
+            Circle()
+                .fill(Color.white)
+                .frame(width: 9, height: 9)
+                .overlay(Circle().stroke(device.tint, lineWidth: 3))
+                .padding(.top, 3)
+        }
+        .compositingGroup()
+        .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
+        .animation(.spring(duration: 0.35, bounce: 0.35), value: selected)
+    }
+}
+
+/// Gelbes Etikett mit Aufenthaltsdauer auf der Karte.
+struct StayLabel: View {
+    let stay: Stay
+    let selected: Bool
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: stay.ongoing ? "figure.stand" : "clock.fill")
+            Text(formatDuration(stay.duration))
+        }
+        .font(.system(size: selected ? 13 : 11, weight: .bold))
+        .foregroundStyle(.black)
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.yellow, in: .capsule)
+        .overlay(Capsule().stroke(.white, lineWidth: selected ? 2.5 : 1.5))
+        .shadow(color: .black.opacity(0.3), radius: 3, y: 1)
+        .offset(y: -18)
+        .animation(.spring(duration: 0.25), value: selected)
+    }
+}
+
+/// Großer, gut sichtbarer Verlaufspunkt.
+struct HistoryDot: View {
+    let color: Color
+    let progress: Double
+    let selected: Bool
+    var body: some View {
+        Circle()
+            .fill(color.opacity(0.35 + 0.65 * progress))
+            .frame(width: selected ? 22 : 14, height: selected ? 22 : 14)
+            .overlay(Circle().stroke(.white, lineWidth: selected ? 3.5 : 2))
+            .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+            .contentShape(Circle().inset(by: -8))
+            .animation(.spring(duration: 0.25), value: selected)
     }
 }
 
@@ -76,7 +223,7 @@ struct StatusPill: View {
                 LiveDot(on: model.liveConnected)
             }
             VStack(alignment: .leading, spacing: 0) {
-                Text(model.liveConnected ? "Live" : "Offline").font(.caption.bold())
+                Text(model.isRefreshing ? "Suche …" : (model.liveConnected ? "Live" : "Offline")).font(.caption.bold())
                 if let lp = model.status?.lastPoll {
                     Text("Abruf \(Date(timeIntervalSince1970: lp).relativeDE)").font(.caption2).foregroundStyle(.secondary)
                 } else if model.status?.apple.isLoggedIn == false {
@@ -93,8 +240,11 @@ struct ToastView: View {
     let text: String
     var body: some View {
         Text(text)
-            .font(.subheadline.weight(.semibold))
-            .padding(.horizontal, 18).padding(.vertical, 12)
+            .font(.footnote.weight(.semibold))
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .frame(maxWidth: 320)
             .glassEffect(.regular, in: .capsule)
             .transition(.move(edge: .top).combined(with: .opacity))
     }
@@ -104,6 +254,7 @@ struct BatteryView: View {
     let level: String?
     var body: some View {
         Image(systemName: BatteryLevel.icon(level))
+            .symbolRenderingMode(.hierarchical)
             .foregroundStyle(BatteryLevel.color(level))
             .accessibilityLabel("Batterie \(BatteryLevel.label(level))")
     }
@@ -118,6 +269,7 @@ struct LevelPicker: View {
                 Label(l.label, systemImage: l.icon).tag(l.rawValue)
             }
         }
+        .onChange(of: level) { _, _ in Haptics.selection() }
     }
 }
 
@@ -141,6 +293,43 @@ struct QRCodeView: View {
     }
 }
 
+/// Karte im Stil der „Wo ist?“-Aktionskacheln.
+struct ActionTile: View {
+    let title: String
+    let subtitle: String?
+    let icon: String
+    let color: Color
+    var active: Bool = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(active ? color : color.opacity(0.9), in: .circle)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.headline).foregroundStyle(.primary).lineLimit(1)
+                if let subtitle {
+                    Text(subtitle).font(.subheadline).foregroundStyle(active ? color : .secondary).lineLimit(1)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color(.secondarySystemGroupedBackground).opacity(0.7), in: .rect(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(active ? color.opacity(0.6) : .clear, lineWidth: 1.5))
+        .contentShape(.rect(cornerRadius: 22))
+    }
+}
+
+struct PressableStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.spring(duration: 0.2), value: configuration.isPressed)
+    }
+}
+
 // MARK: - Karte
 
 enum MapStyleChoice: String, CaseIterable, Identifiable {
@@ -148,9 +337,16 @@ enum MapStyleChoice: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var style: MapStyle {
         switch self {
-        case .standard: .standard(elevation: .realistic, pointsOfInterest: .excludingAll)
+        case .standard: .standard(elevation: .realistic, pointsOfInterest: .including([.publicTransport, .parking, .store, .restaurant, .cafe]))
         case .hybrid: .hybrid(elevation: .realistic)
         case .imagery: .imagery(elevation: .realistic)
+        }
+    }
+    var label: String {
+        switch self {
+        case .standard: "Standard"
+        case .hybrid: "Hybrid"
+        case .imagery: "Satellit"
         }
     }
     var icon: String {
@@ -158,13 +354,6 @@ enum MapStyleChoice: String, CaseIterable, Identifiable {
         case .standard: "map"
         case .hybrid: "map.fill"
         case .imagery: "globe.europe.africa.fill"
-        }
-    }
-    var next: MapStyleChoice {
-        switch self {
-        case .standard: .hybrid
-        case .hybrid: .imagery
-        case .imagery: .standard
         }
     }
 }
@@ -189,10 +378,16 @@ func appleMapsURL(_ r: Report, name: String, directions: Bool = false) -> URL? {
                : "https://maps.apple.com/?ll=\(r.lat),\(r.lon)&q=\(q)")
 }
 
+@MainActor
 struct LocationPermission {
-    static let manager = CLLocationManager()
+    static let manager: CLLocationManager = {
+        let m = CLLocationManager()
+        m.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        return m
+    }()
     static func request() {
         if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
+        manager.startUpdatingLocation()
     }
 }
 
@@ -209,8 +404,8 @@ struct GlassSection<Content: View>: View {
             }
             content
         }
-        .padding(18)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+        .background(Color(.secondarySystemGroupedBackground).opacity(0.7), in: .rect(cornerRadius: 22))
     }
 }

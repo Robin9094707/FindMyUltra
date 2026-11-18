@@ -201,7 +201,7 @@ struct NotificationsView: View {
             }
             ForEach(model.notifications) { n in
                 Button {
-                    if let id = n.deviceId, model.device(id) != nil { model.alertsPath.append(DeviceRoute(id: id)) }
+                    if let id = n.deviceId, model.device(id) != nil { model.openDevice(id) }
                 } label: {
                     HStack(alignment: .top, spacing: 12) {
                         let lvl = AlertLevel.of(n.level)
@@ -223,21 +223,29 @@ struct NotificationsView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .listRowBackground(Color(.secondarySystemGroupedBackground).opacity(0.6))
             }
         }
-        .navigationTitle("Mitteilungen")
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
         .refreshable { await model.reloadNotifications() }
-        .toolbar {
-            if !model.notifications.isEmpty {
-                ToolbarItem(placement: .topBarTrailing) {
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack {
+                Text("Mitteilungen").font(.largeTitle.bold())
+                Spacer()
+                if !model.notifications.isEmpty {
                     Button("Leeren", role: .destructive) {
+                        Haptics.light()
                         Task {
                             _ = try? await model.api?.send("DELETE", "/api/notifications", as: OKResult.self)
                             model.notifications = []
                         }
                     }
+                    .buttonStyle(.glass)
                 }
             }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
         }
         .task { await model.reloadNotifications() }
     }

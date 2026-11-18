@@ -65,9 +65,17 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         return u
     }
 
+    /// Kodiert ein Pfadsegment vollständig (Apple-IDs enthalten „/“, „+“, „=“).
+    static func seg(_ s: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+    }
+
     func url(_ path: String, query: [URLQueryItem] = []) throws -> URL {
         guard var c = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw APIError.invalidURL }
-        c.path = (c.path.hasSuffix("/") ? String(c.path.dropLast()) : c.path) + path
+        let base = c.percentEncodedPath
+        c.percentEncodedPath = (base.hasSuffix("/") ? String(base.dropLast()) : base) + path
         if !query.isEmpty { c.queryItems = query }
         guard let u = c.url else { throw APIError.invalidURL }
         return u
@@ -138,6 +146,18 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         } catch APIError.http(400, let msg, _) {
             return ImportResult(ok: false, added: [], errors: [.init(file: "Import", error: msg)])
         }
+    }
+
+    func uploadOne<T: Decodable>(_ path: String, query: [URLQueryItem] = [], name: String, data: Data) async throws -> T {
+        let boundary = "fmu-\(UUID().uuidString)"
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(name)\"\r\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+        body.append(data)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        return try decode(try await raw("POST", path, query: query, body: body,
+                                        contentType: "multipart/form-data; boundary=\(boundary)"))
     }
 
     func decode<T: Decodable>(_ data: Data) throws -> T {
