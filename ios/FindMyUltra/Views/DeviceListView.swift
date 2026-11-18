@@ -13,8 +13,15 @@ struct DeviceListView: View {
                         .listRowBackground(Color.yellow.opacity(0.12))
                 }
             }
+            if model.presentNetworks.count > 1 {
+                Section {
+                    NetworkFilterBar()
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
+                }
+            }
             Section {
-                ForEach(model.items) { d in
+                ForEach(model.visibleItems) { d in
                     Button {
                         model.openDevice(d.id)
                     } label: {
@@ -25,12 +32,12 @@ struct DeviceListView: View {
                     .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                     .swipeActions(edge: .trailing) {
                         Button {
-                            Task { await model.refresh(deviceID: d.id) }
+                            Task { await model.locate(d) }
                         } label: { Label("Orten", systemImage: "location.magnifyingglass") }
                         .tint(.blue)
                     }
                     .contextMenu {
-                        Button { Task { await model.refresh(deviceID: d.id) } } label: {
+                        Button { Task { await model.locate(d) } } label: {
                             Label("Jetzt orten", systemImage: "location.magnifyingglass")
                         }
                         Button {
@@ -58,9 +65,19 @@ struct DeviceListView: View {
                 ContentUnavailableView {
                     Label("Keine Objekte", systemImage: "airtag")
                 } description: {
-                    Text("Importiere die JSON- oder plist-Schlüssel deiner AirTags.")
+                    Text("Importiere die JSON- oder plist-Schlüssel deiner AirTags oder verbinde Google bzw. Samsung unter „Ich → Netzwerke“.")
                 } actions: {
                     Button("Schlüssel importieren") { importing = true }.buttonStyle(.glassProminent)
+                    Button("Netzwerke verbinden") { model.section = .me; model.sheetPath = [] }.buttonStyle(.glass)
+                }
+                .listRowBackground(Color.clear)
+            } else if model.visibleItems.isEmpty {
+                ContentUnavailableView {
+                    Label("Nichts in diesem Netz", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text("Der Netz-Filter blendet gerade alle Objekte aus.")
+                } actions: {
+                    Button("Alle Netze zeigen") { model.showOnly(nil) }.buttonStyle(.glass)
                 }
                 .listRowBackground(Color.clear)
             }
@@ -108,6 +125,7 @@ struct DeviceRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(device.name).font(.headline).lineLimit(1)
+                    if device.net != .apple { tag(device.net.label.uppercased(), device.net.color) }
                     if device.lost.enabled { tag("VERLOREN", .red) }
                     if device.isGuarded { tag("WACHE", .orange) }
                     if !device.enabled { tag("PAUSE", .gray) }

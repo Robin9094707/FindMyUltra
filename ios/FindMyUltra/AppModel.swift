@@ -78,6 +78,16 @@ final class AppModel {
         didSet { UserDefaults.standard.set(showAppleOnMap, forKey: "showAppleOnMap") }
     }
     private var appleReloadTask: Task<Void, Never>?
+    private var statusReloadTask: Task<Void, Never>?
+
+    /// Netz-Filter (Apple, Google, Samsung) für Karte und Objektliste.
+    var networkFilter: Set<TrackerNetwork> = {
+        let raw = UserDefaults.standard.stringArray(forKey: "networkFilter") ?? TrackerNetwork.allCases.map(\.rawValue)
+        let set = Set(raw.compactMap(TrackerNetwork.init(rawValue:)))
+        return set.isEmpty ? Set(TrackerNetwork.allCases) : set
+    }() {
+        didSet { UserDefaults.standard.set(networkFilter.map(\.rawValue), forKey: "networkFilter") }
+    }
 
     // Aufzeichnungen (Standortverlauf von Apple-Geräten)
     var recordings: [String: [Recording]] = [:]
@@ -239,6 +249,8 @@ final class AppModel {
             isConnected = true
             startLive()
             await loadNewSince()
+            GoogleLink.shared.attach(self)
+            await GoogleLink.shared.start()
         } catch let e as APIError where e.isUnauthorized {
             isConnected = false
         } catch {
@@ -280,6 +292,8 @@ final class AppModel {
         isConnected = true
         startLive()
         requestNotificationPermission()
+        GoogleLink.shared.attach(self)
+        Task { await GoogleLink.shared.start() }
     }
 
     func logout() async {
@@ -615,8 +629,8 @@ final class AppModel {
     }
 
     func fitAll() {
-        var coords = items.compactMap(\.last).map(\.coordinate)
-        if showAppleOnMap { coords += appleDevices.compactMap(\.best).map(\.coordinate) }
+        var coords = visibleItems.compactMap(\.last).map(\.coordinate)
+        if showAppleOnMap && networkFilter.contains(.apple) { coords += appleDevices.compactMap(\.best).map(\.coordinate) }
         if let r = region(fitting: coords, padding: 1.6) { show(region: r) }
     }
 
@@ -726,6 +740,12 @@ final class AppModel {
         case "apple_devices":
             scheduleAppleReload()
             scheduleRecordingReload()
+        case "networks":
+            statusReloadTask?.cancel()
+            statusReloadTask = Task {
+                try? await Task.sleep(for: .milliseconds(500))
+                if !Task.isCancelled { await reloadStatus() }
+            }
         case "settings":
             if let s = try? api.decoder.decode(ServerSettings.self, from: data) { settings = s }
         case "notification":

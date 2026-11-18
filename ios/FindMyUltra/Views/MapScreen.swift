@@ -25,7 +25,7 @@ struct MapScreen: View {
     @State private var showStyleMenu = false
 
     private var pins: [Pin] {
-        model.items.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
+        model.visibleItems.compactMap { d in d.last.map { Pin(device: d, report: $0) } }
     }
 
     private var focused: Device? { model.focusedID.flatMap { model.device($0) } }
@@ -164,7 +164,7 @@ struct MapScreen: View {
             }
 
             // Apple-Geräte (bester Standort: online oder offline)
-            if model.showAppleOnMap {
+            if model.showAppleOnMap && model.isShown(.apple) {
                 ForEach(model.appleDevices.filter { $0.best != nil }) { a in
                     if let b = a.best {
                         if model.circleMode != .off {
@@ -230,6 +230,13 @@ struct MapScreen: View {
                     Picker("Genauigkeitskreise", selection: Binding(get: { model.circleMode }, set: { model.circleMode = $0 })) {
                         ForEach(CircleMode.allCases) { Text("Kreise: \($0.label)").tag($0) }
                     }
+                    Section("Netze") {
+                        ForEach(TrackerNetwork.allCases) { n in
+                            Toggle(isOn: Binding(get: { model.isShown(n) }, set: { _ in model.toggleFilter(n) })) {
+                                Label(n.longLabel, systemImage: n.symbol)
+                            }
+                        }
+                    }
                     Toggle("Apple-Geräte anzeigen", isOn: Binding(get: { model.showAppleOnMap }, set: { model.showAppleOnMap = $0; Haptics.light() }))
                     Toggle("Aufenthalte anzeigen", isOn: Binding(get: { model.showStays }, set: { model.showStays = $0; Haptics.light() }))
                 } label: {
@@ -266,7 +273,10 @@ struct MapScreen: View {
             .glassEffect(.regular.interactive(), in: .capsule)
 
             Button {
-                Task { await model.refresh(deviceID: model.focusedID) }
+                Task {
+                    if let id = model.focusedID, let d = model.device(id) { await model.locate(d) }
+                    else { await model.refresh() }
+                }
             } label: {
                 Group {
                     if model.isRefreshing {

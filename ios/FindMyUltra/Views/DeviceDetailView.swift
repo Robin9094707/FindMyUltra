@@ -77,7 +77,11 @@ struct DeviceDetailView: View {
                 }
             }
         } message: {
-            Text("Die Schlüssel werden vom Server gelöscht. Du kannst sie jederzeit erneut importieren.")
+            if let d = device, d.net != .apple {
+                Text("Der Tracker wird aus FindMy Ultra entfernt und bei der nächsten \(d.net.label)-Synchronisierung nicht wieder angelegt. Wiederherstellen: Ich → Netzwerke → \(d.net.label) → „Alle Tracker wieder anzeigen“.")
+            } else {
+                Text("Die Schlüssel werden vom Server gelöscht. Du kannst sie jederzeit erneut importieren.")
+            }
         }
     }
 
@@ -119,6 +123,7 @@ struct DeviceDetailView: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(d.name).font(.title.bold()).lineLimit(2)
+                if d.net != .apple { NetworkTag(network: d.net) }
                 if let r = d.last {
                     Text(address ?? String(format: "%.5f, %.5f", r.lat, r.lon))
                         .font(.body).foregroundStyle(.secondary).lineLimit(1)
@@ -140,9 +145,15 @@ struct DeviceDetailView: View {
             Menu {
                 Button { sheet = .edit } label: { Label("Bearbeiten", systemImage: "pencil") }
                 Button { sheet = .alerts } label: { Label("Alarme", systemImage: "bell.badge") }
-                Button {
-                    Task { await model.refresh(deviceID: deviceID, full: true) }
-                } label: { Label("7-Tage-Scan", systemImage: "clock.arrow.2.circlepath") }
+                if d.net == .apple {
+                    Button {
+                        Task { await model.refresh(deviceID: deviceID, full: true) }
+                    } label: { Label("7-Tage-Scan", systemImage: "clock.arrow.2.circlepath") }
+                } else if d.net == .google, model.networks?.google?.serverReady == true {
+                    Button {
+                        Task { await model.refresh(deviceID: deviceID) }
+                    } label: { Label("Über den Server orten", systemImage: "server.rack") }
+                }
                 Button {
                     Haptics.light()
                     Task { try? await model.patchDevice(deviceID, ["enabled": !d.enabled]) }
@@ -189,10 +200,10 @@ struct DeviceDetailView: View {
     private func actions(_ d: Device) -> some View {
         LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
             Button {
-                Task { await model.refresh(deviceID: d.id) }
+                Task { await model.locate(d) }
             } label: {
                 ActionTile(title: model.isRefreshing ? "Suche …" : "Orten",
-                           subtitle: model.thoroughRefresh ? "Gründlich (7 Tage)" : "Schnell", icon: "location.magnifyingglass", color: .blue)
+                           subtitle: locateSubtitle(d), icon: "location.magnifyingglass", color: .blue)
             }
             .disabled(model.isRefreshing)
             Button {
@@ -219,6 +230,14 @@ struct DeviceDetailView: View {
             }
         }
         .buttonStyle(PressableStyle())
+    }
+
+    private func locateSubtitle(_ d: Device) -> String {
+        switch d.net {
+        case .apple: model.thoroughRefresh ? "Gründlich (7 Tage)" : "Schnell"
+        case .google: GoogleLink.shared.snapshot(for: d) != nil ? "Direkt am iPhone" : "Über den Server"
+        case .samsung: "SmartThings Find"
+        }
     }
 
     private func alertSummary(_ d: Device) -> String {

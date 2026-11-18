@@ -17,6 +17,23 @@ struct SettingsView: View {
         Form {
             serverSection
             Section {
+                ForEach(TrackerNetwork.allCases) { n in
+                    NavigationLink {
+                        switch n {
+                        case .apple: AppleAccountView()
+                        case .google: GoogleNetworkView()
+                        case .samsung: SamsungNetworkView()
+                        }
+                    } label: {
+                        NetworkRow(network: n)
+                    }
+                }
+            } header: {
+                Text("Netzwerke")
+            } footer: {
+                Text("Apple, Google Find Hub und Samsung SmartThings Find – jedes Netz lässt sich einzeln verbinden und ein- oder ausschalten. Was auf Karte und in der Liste erscheint, wählst du über den Netz-Filter.")
+            }
+            Section {
                 NavigationLink {
                     AppleAccountView()
                 } label: {
