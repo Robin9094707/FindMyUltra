@@ -16,8 +16,17 @@ final class GoogleLink {
 
     /// Google wurde auf diesem iPhone eingerichtet. Erst dann startet die Engine
     /// (spart Speicher, Bluetooth und Netzwerk, wenn Google gar nicht genutzt wird).
+    /// Erkennt auch eine Anmeldung aus einer früheren Version (Konto in den Engine-Einstellungen).
     static var inUse: Bool {
-        get { UserDefaults.standard.bool(forKey: "googleInUse") }
+        get {
+            if UserDefaults.standard.bool(forKey: "googleInUse") { return true }
+            let spot = UserDefaults(suiteName: "de.findmyultra.spot")
+            if spot?.object(forKey: "username") != nil {
+                UserDefaults.standard.set(true, forKey: "googleInUse")
+                return true
+            }
+            return false
+        }
         set { UserDefaults.standard.set(newValue, forKey: "googleInUse") }
     }
 
@@ -215,6 +224,29 @@ extension AppModel {
     /// „Orten“ – je nach Netz: Google zuerst direkt auf dem iPhone, sonst über den Server.
     func locate(_ d: Device) async {
         guard !isRefreshing else { return }
+        if d.net == .google, let ext = d.extId {
+            let store = GoogleTrackerStore.shared
+            if GoogleLink.inUse, !store.hasDevice(ext) {
+                // Engine evtl. noch nicht gestartet bzw. Trackerliste noch nicht geladen
+                isRefreshing = true
+                await GoogleLink.shared.start()
+                if store.hasCredentials, !store.hasDevice(ext) { await store.refresh(requestLocations: false) }
+                // Die Trackerliste wird leicht verzögert veröffentlicht – kurz darauf warten
+                var waited = 0
+                while store.hasCredentials, !store.hasDevice(ext), waited < 40 {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    waited += 1
+                }
+                isRefreshing = false
+            }
+            if !(GoogleLink.inUse && store.hasDevice(ext)), networks?.google?.serverReady != true {
+                Haptics.warning()
+                showToast(store.hasCredentials
+                          ? "Tracker nicht im Google-Konto dieses iPhones gefunden"
+                          : "Google ist auf diesem iPhone nicht verbunden – Ich → Netzwerke → Google")
+                return
+            }
+        }
         if d.net == .google, GoogleLink.inUse, let ext = d.extId, GoogleTrackerStore.shared.hasDevice(ext) {
             Haptics.soft()
             isRefreshing = true

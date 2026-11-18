@@ -4,8 +4,8 @@ Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Ger
 
 | Teil | Was | Version |
 |---|---|---|
-| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.1 |
-| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.1 |
+| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.2 |
+| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.2 |
 
 > Das Projekt extrahiert keine Schlüssel. Du importierst deine vorhandenen JSON- oder plist-Schlüsseldateien.
 > Es nutzt inoffizielle Apple-Schnittstellen, die sich jederzeit ändern können. Verwende es nur für deine eigenen Geräte.
@@ -159,6 +159,8 @@ Unter der Server-Adresse findest du Karte, Verlauf mit Zeitleiste, Apple-Login, 
 ---
 
 ## Google & Samsung (1.7)
+
+**Neu in 1.7.2:** Google-Tracker lassen sich wieder direkt am iPhone orten, auch wenn die Google-Anmeldung aus einer früheren Version stammt. Fehlt der Google-Zugang, sagt die App das jetzt klar, statt „0 neue Standorte“ zu melden.
 
 **Neu in 1.7.1:** Absturz beim Aktualisieren eines Google-Trackers behoben. Die App startet nach kurzem Wechsel nicht mehr bei null, sondern zeigt sofort den letzten Stand und die zuletzt geöffnete Ansicht. Im Geräte-Tab sind iPad, AirPods & Co. immer auf der Karte, unabhängig vom Netz-Filter. Ist ein Verlauf offen, zeigt die Karte nur diesen Tracker. Die Objektliste ist nach Netz gruppiert.
 
