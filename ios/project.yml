@@ -7,16 +7,69 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.6.0"
-    CURRENT_PROJECT_VERSION: "12"
+    MARKETING_VERSION: "1.7.2"
+    CURRENT_PROJECT_VERSION: "15"
     DEVELOPMENT_TEAM: ""
+packages:
+  # Google Find Hub direkt auf dem iPhone (Spot-Engine, aus RJ TrackerApp übernommen).
+  # Versionen wie im Spot-Upstream (Package.resolved) – neuere Digest-Versionen passen nicht zu SwiftECC 5.4.0.
+  SwiftECC:
+    url: https://github.com/leif-ibsen/SwiftECC.git
+    exactVersion: 5.4.0
+  SwiftProtobuf:
+    url: https://github.com/apple/swift-protobuf.git
+    exactVersion: 1.29.0
+  Digest:
+    url: https://github.com/leif-ibsen/Digest
+    exactVersion: 1.12.0
+  BigInt:
+    url: https://github.com/leif-ibsen/BigInt
+    exactVersion: 1.21.0
+  ASN1:
+    url: https://github.com/leif-ibsen/ASN1
+    exactVersion: 2.7.0
+  CryptoSwift:
+    url: https://github.com/krzyzanowskim/CryptoSwift.git
+    exactVersion: 1.8.4
 targets:
+  SpotIntegration:
+    type: framework
+    platform: iOS
+    sources:
+      - path: Vendor/Spot/Sources
+      - path: Vendor/Spot/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Vendor/Spot/Licenses
+        buildPhase: resources
+      - path: Vendor/Spot/LICENSE
+        buildPhase: resources
+    dependencies:
+      - package: SwiftECC
+      - package: SwiftProtobuf
+      - package: CryptoSwift
+      - package: Digest
+      - package: BigInt
+      - package: ASN1
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.findmyultra.spotintegration
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        SWIFT_EMIT_LOC_STRINGS: NO
   FindMyUltra:
     type: application
     platform: iOS
     scheme: {}
     sources:
       - path: FindMyUltra
+    dependencies:
+      - target: SpotIntegration
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: de.findmyultra.app
@@ -63,6 +116,9 @@ targets:
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: FindMy Ultra verbindet sich mit deinem Server im lokalen Netzwerk.
         NSLocationWhenInUseUsageDescription: Zeigt deinen eigenen Standort auf der Karte neben deinen Objekten.
+        NSLocationAlwaysAndWhenInUseUsageDescription: Optional für Google Find Hub – verschlüsselte Sichtungsmeldungen deiner eigenen Google-Tracker.
+        NSBluetoothAlwaysUsageDescription: Findet deine eigenen Google-Tracker in der Nähe und lässt sie klingeln.
+        NSNearbyInteractionUsageDescription: Prüft die Nahortung deiner eigenen Tracker.
         CFBundleURLTypes:
           - CFBundleURLName: de.findmyultra.app
             CFBundleURLSchemes:

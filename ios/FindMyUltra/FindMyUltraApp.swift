@@ -1,5 +1,6 @@
 import SwiftUI
 import UserNotifications
+import SpotIntegration
 
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     var onOpen: (@MainActor (URL) -> Void)?
@@ -43,11 +44,16 @@ struct FindMyUltraApp: App {
                         if model.isConnected {
                             model.startLive()
                             model.markOpened()
-                            Task { try? await model.loadAll() }
+                            Task { await model.refreshOnActivate() }
                         }
+                        if GoogleLink.inUse { GoogleTrackerStore.shared.sceneChanged(active: true) }
                     case .background:
                         model.markBackground()
                         model.stopLive()
+                        if GoogleLink.inUse {
+                            GoogleTrackerStore.shared.sceneChanged(active: false)
+                            Task { await GoogleLink.shared.push() }
+                        }
                     default: break
                     }
                 }

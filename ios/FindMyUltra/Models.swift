@@ -83,8 +83,12 @@ struct Device: Codable, Identifiable, Hashable {
     var battery: String?
     var sort: Int?
     var category: String?
+    // 1.7: Ortungsnetz (apple | google | samsung) und ID im fremden Netz
+    var network: String?
+    var extId: String?
 
     var isItem: Bool { (category ?? "item") == "item" }
+    var net: TrackerNetwork { TrackerNetwork(rawValue: network ?? "apple") ?? .apple }
 
     var tint: Color { Color(hex: color ?? "#0A84FF") }
     var symbol: String { (emoji?.isEmpty == false ? emoji : nil) ?? "📍" }
@@ -128,6 +132,150 @@ struct ServerStatus: Codable, Hashable {
     var devices: Int
     var pollInterval: Int
     var retentionDays: Int
+    var networks: NetworksStatus?
+}
+
+// MARK: - Ortungsnetze (Apple, Google, Samsung)
+
+enum TrackerNetwork: String, CaseIterable, Identifiable, Codable, Hashable {
+    case apple, google, samsung
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .apple: "Apple"
+        case .google: "Google"
+        case .samsung: "Samsung"
+        }
+    }
+    var longLabel: String {
+        switch self {
+        case .apple: "Apple „Wo ist?“"
+        case .google: "Google Find Hub"
+        case .samsung: "Samsung SmartThings Find"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .apple: "apple.logo"
+        case .google: "g.circle.fill"
+        case .samsung: "s.circle.fill"
+        }
+    }
+    /// Symbol für Tracker ohne eigenes Emoji.
+    var trackerSymbol: String {
+        switch self {
+        case .apple: "airtag.fill"
+        case .google: "sensor.tag.radiowaves.forward.fill"
+        case .samsung: "tag.fill"
+        }
+    }
+    var color: Color {
+        switch self {
+        case .apple: Color(.label)
+        case .google: Color(red: 0.20, green: 0.66, blue: 0.33)
+        case .samsung: Color(red: 0.08, green: 0.36, blue: 0.85)
+        }
+    }
+}
+
+struct SetupState: Codable, Hashable { var status: String?; var message: String? }
+
+/// Status eines Netzes vom Server – alles optional, damit neue Felder nichts kaputtmachen.
+struct NetworkStatus: Codable, Hashable {
+    var network: String?
+    var enabled: Bool?
+    var connected: Bool?
+    var account: String?
+    var devices: Int?
+    var error: String?
+    var lastRefresh: Double?
+    var lastSync: Double?
+    var interval: Int?
+    // Samsung
+    var pin: Bool?
+    var pinRequired: Bool?
+    var history: Bool?
+    var loginPending: Bool?
+    // Google (Server)
+    var serverMode: String?
+    var secrets: Bool?
+    var keys: Bool?
+    var toolsReady: Bool?
+    var setup: SetupState?
+    var lastAppPush: Double?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ k: CodingKeys) -> T? { (try? c.decodeIfPresent(T.self, forKey: k)) ?? nil }
+        network = v(.network); enabled = v(.enabled); connected = v(.connected); account = v(.account)
+        devices = v(.devices); error = v(.error); lastRefresh = v(.lastRefresh); lastSync = v(.lastSync)
+        interval = v(.interval); pin = v(.pin); pinRequired = v(.pinRequired); history = v(.history)
+        loginPending = v(.loginPending); serverMode = v(.serverMode); secrets = v(.secrets); keys = v(.keys)
+        toolsReady = v(.toolsReady); setup = v(.setup); lastAppPush = v(.lastAppPush)
+    }
+    var isEnabled: Bool { enabled ?? true }
+    var serverReady: Bool { (secrets ?? false) && (keys ?? false) && (toolsReady ?? false) }
+}
+
+struct NetworksStatus: Codable, Hashable {
+    var apple: NetworkStatus?
+    var google: NetworkStatus?
+    var samsung: NetworkStatus?
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        apple = (try? c.decodeIfPresent(NetworkStatus.self, forKey: .apple)) ?? nil
+        google = (try? c.decodeIfPresent(NetworkStatus.self, forKey: .google)) ?? nil
+        samsung = (try? c.decodeIfPresent(NetworkStatus.self, forKey: .samsung)) ?? nil
+    }
+    func of(_ n: TrackerNetwork) -> NetworkStatus? {
+        switch n {
+        case .apple: apple
+        case .google: google
+        case .samsung: samsung
+        }
+    }
+}
+
+struct AppleNetConfig: Codable, Hashable { var enabled: Bool }
+struct GoogleNetConfig: Codable, Hashable {
+    var enabled: Bool
+    var serverMode: String
+    var interval: Int
+    var appGraceMin: Int
+}
+struct SamsungNetConfig: Codable, Hashable {
+    var enabled: Bool
+    var interval: Int
+    var history: Bool
+}
+struct NetworksConfig: Codable, Hashable {
+    var apple: AppleNetConfig
+    var google: GoogleNetConfig
+    var samsung: SamsungNetConfig
+    func enabled(_ n: TrackerNetwork) -> Bool {
+        switch n {
+        case .apple: apple.enabled
+        case .google: google.enabled
+        case .samsung: samsung.enabled
+        }
+    }
+    mutating func setEnabled(_ n: TrackerNetwork, _ on: Bool) {
+        switch n {
+        case .apple: apple.enabled = on
+        case .google: google.enabled = on
+        case .samsung: samsung.enabled = on
+        }
+    }
+}
+
+struct SamsungLoginStart: Codable { var ok: Bool?; var loginUrl: String; var redirectScheme: String? }
+struct NetworkActionResult: Codable {
+    var ok: Bool?
+    var new: Int?
+    var tags: Int?
+    var trackers: Int?
+    var added: Int?
+    var status: NetworkStatus?
 }
 
 struct Zone: Codable, Identifiable, Hashable {
@@ -528,6 +676,7 @@ struct ServerSettings: Codable, Hashable {
     var quietHours: QuietHours
     var stays: StaysConfig?
     var onlineDevices: OnlineDevicesConfig?
+    var networks: NetworksConfig?
 }
 
 struct Passkey: Codable, Identifiable, Hashable {

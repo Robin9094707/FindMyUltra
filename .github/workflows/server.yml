@@ -1,0 +1,76 @@
+name: Server
+
+on:
+  push:
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Prüfen & Serverdatei bereitstellen
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax prüfen
+        run: python -m py_compile server/findmy_ultra.py
+
+      - name: Abhängigkeiten
+        run: pip install -q "findmy>=0.10.2" "aiohttp>=3.9.5,<4"
+
+      - name: Demo-Server starten und API testen
+        run: |
+          set -e
+          python server/findmy_ultra.py --demo --no-bootstrap --port 5071 --data /tmp/fmu > /tmp/fmu.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf localhost:5071/api/health >/dev/null && break; sleep 1; done
+          PW=$(grep -oP 'Passwort: \K\S+' /tmp/fmu/ERSTES-PASSWORT.txt)
+          TOKEN=$(curl -sf localhost:5071/api/auth/login -H 'Content-Type: application/json' \
+            -d "{\"username\":\"admin\",\"password\":\"$PW\"}" | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+          H="Authorization: Bearer $TOKEN"
+          curl -sf localhost:5071/api/devices -H "$H" | python -c "
+          import sys, json
+          d = json.load(sys.stdin)['devices']
+          nets = {x['network'] for x in d}
+          print(len(d), 'Objekte, Netze:', sorted(nets))
+          assert {'apple', 'google', 'samsung'} <= nets"
+          curl -sf localhost:5071/api/networks -H "$H" > /dev/null
+          curl -sf -XPOST localhost:5071/api/google/app-reports -H "$H" -H 'Content-Type: application/json' \
+            -d '{"devices":[{"id":"ci-test","name":"CI","reports":[{"ts":1763400000,"lat":52.1,"lon":13.1,"accuracy":10}]}]}'
+          echo
+          curl -sf localhost:5071/api/status -H "$H" | python -c "import sys,json;s=json.load(sys.stdin);print('Server', s['version'])"
+          kill %1 || true
+
+      - name: Log bei Fehler
+        if: failure()
+        run: cat /tmp/fmu.log || true
+
+      - name: Serverdatei hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: findmy_ultra-server
+          path: |
+            server/findmy_ultra.py
+            server/requirements.txt
+          if-no-files-found: error
+
+      - name: Release (bei Tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: server/findmy_ultra.py

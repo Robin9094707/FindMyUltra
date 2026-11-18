@@ -79,10 +79,14 @@ struct DeviceGlyph: View {
     var body: some View {
         if let e = device.emoji, !e.isEmpty, e != "📍" {
             Text(e).font(.system(size: size))
-        } else {
+        } else if device.net == .apple {
             Image(systemName: "airtag.fill")
                 .font(.system(size: size * 0.85, weight: .regular))
                 .foregroundStyle(.white, Color(.systemGray3))
+        } else {
+            Image(systemName: device.net.trackerSymbol)
+                .font(.system(size: size * 0.72, weight: .medium))
+                .foregroundStyle(device.net.color.gradient)
         }
     }
 }
@@ -103,8 +107,40 @@ struct EmojiBadge: View {
                 } else if device.isGuarded {
                     Image(systemName: "lock.shield.fill")
                         .font(.system(size: size * 0.3)).foregroundStyle(.white, .orange)
+                } else if device.net != .apple {
+                    NetworkBadge(network: device.net, size: size * 0.36)
                 }
             }
+    }
+}
+
+/// Kleines Netz-Abzeichen (G / S) wie ein App-Badge.
+struct NetworkBadge: View {
+    let network: TrackerNetwork
+    var size: CGFloat = 16
+    var body: some View {
+        Image(systemName: network.symbol)
+            .font(.system(size: size * 0.78, weight: .bold))
+            .foregroundStyle(.white, network.color)
+            .frame(width: size, height: size)
+            .background(Circle().fill(network == .apple ? Color(.label) : network.color))
+            .overlay(Circle().stroke(Color(.systemBackground), lineWidth: max(1, size * 0.1)))
+            .accessibilityLabel(network.longLabel)
+    }
+}
+
+/// Netz-Etikett für Kopfzeilen („Google Find Hub“).
+struct NetworkTag: View {
+    let network: TrackerNetwork
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: network.symbol)
+            Text(network.longLabel)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(network == .apple ? Color.secondary : network.color)
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background((network == .apple ? Color.secondary : network.color).opacity(0.14), in: .capsule)
     }
 }
 
@@ -146,6 +182,10 @@ struct AirTagPin: View {
                     .overlay(Circle().stroke(device.lost.enabled ? Color.red : Color.white.opacity(0.12), lineWidth: device.lost.enabled ? 3 : 1))
                 DeviceGlyph(device: device, size: bubble * 0.5)
                     .opacity(stale ? 0.75 : 1)
+                if device.net != .apple {
+                    NetworkBadge(network: device.net, size: selected ? 20 : 17)
+                        .offset(x: bubble * 0.36, y: bubble * 0.36)
+                }
             }
             PinTail()
                 .fill(Color(.secondarySystemGroupedBackground))

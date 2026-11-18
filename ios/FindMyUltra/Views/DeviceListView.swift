@@ -13,54 +13,52 @@ struct DeviceListView: View {
                         .listRowBackground(Color.yellow.opacity(0.12))
                 }
             }
-            Section {
-                ForEach(model.items) { d in
-                    Button {
-                        model.openDevice(d.id)
-                    } label: {
-                        DeviceRow(device: d)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                    .swipeActions(edge: .trailing) {
-                        Button {
-                            Task { await model.refresh(deviceID: d.id) }
-                        } label: { Label("Orten", systemImage: "location.magnifyingglass") }
-                        .tint(.blue)
-                    }
-                    .contextMenu {
-                        Button { Task { await model.refresh(deviceID: d.id) } } label: {
-                            Label("Jetzt orten", systemImage: "location.magnifyingglass")
+            if model.presentNetworks.count > 1 {
+                Section {
+                    NetworkFilterBar()
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
+                }
+            }
+            let groups = groupedItems
+            ForEach(groups, id: \.network) { g in
+                Section {
+                    ForEach(g.items) { d in row(d) }
+                } header: {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if groups.count > 1 {
+                            Image(systemName: g.network.symbol).foregroundStyle(g.network == .apple ? Color.primary : g.network.color)
+                            Text("\(g.network.label) · \(g.items.count)")
+                        } else {
+                            Text("Meine Objekte")
                         }
-                        Button {
-                            Haptics.light()
-                            Task { try? await model.patchDevice(d.id, ["enabled": !d.enabled]) }
-                        } label: {
-                            Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen",
-                                  systemImage: d.enabled ? "pause.circle" : "play.circle")
+                        Spacer()
+                        if g.network == groups.first?.network, let s = model.status {
+                            Text("\(s.stats.total) Standorte · \(s.stats.today) heute")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    .textCase(nil)
                 }
-            } header: {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Meine Objekte")
-                    Spacer()
-                    if let s = model.status {
-                        Text("\(s.stats.total) Standorte · \(s.stats.today) heute")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                .textCase(nil)
             }
 
             if model.items.isEmpty {
                 ContentUnavailableView {
                     Label("Keine Objekte", systemImage: "airtag")
                 } description: {
-                    Text("Importiere die JSON- oder plist-Schlüssel deiner AirTags.")
+                    Text("Importiere die JSON- oder plist-Schlüssel deiner AirTags oder verbinde Google bzw. Samsung unter „Ich → Netzwerke“.")
                 } actions: {
                     Button("Schlüssel importieren") { importing = true }.buttonStyle(.glassProminent)
+                    Button("Netzwerke verbinden") { model.section = .me; model.sheetPath = [] }.buttonStyle(.glass)
+                }
+                .listRowBackground(Color.clear)
+            } else if model.visibleItems.isEmpty {
+                ContentUnavailableView {
+                    Label("Nichts in diesem Netz", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text("Der Netz-Filter blendet gerade alle Objekte aus.")
+                } actions: {
+                    Button("Alle Netze zeigen") { model.showOnly(nil) }.buttonStyle(.glass)
                 }
                 .listRowBackground(Color.clear)
             }
@@ -97,6 +95,48 @@ struct DeviceListView: View {
     }
 }
 
+extension DeviceListView {
+    struct NetworkGroup { let network: TrackerNetwork; let items: [Device] }
+
+    /// Bei mehreren sichtbaren Netzen nach Netz gruppiert, sonst eine Liste.
+    var groupedItems: [NetworkGroup] {
+        let items = model.visibleItems
+        guard !items.isEmpty else { return [] }
+        let nets = TrackerNetwork.allCases.filter { n in items.contains { $0.net == n } }
+        if nets.count <= 1 { return [NetworkGroup(network: nets.first ?? .apple, items: items)] }
+        return nets.map { n in NetworkGroup(network: n, items: items.filter { $0.net == n }) }
+    }
+
+    func row(_ d: Device) -> some View {
+        Button {
+            model.openDevice(d.id)
+        } label: {
+            DeviceRow(device: d)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+        .swipeActions(edge: .trailing) {
+            Button {
+                Task { await model.locate(d) }
+            } label: { Label("Orten", systemImage: "location.magnifyingglass") }
+            .tint(.blue)
+        }
+        .contextMenu {
+            Button { Task { await model.locate(d) } } label: {
+                Label("Jetzt orten", systemImage: "location.magnifyingglass")
+            }
+            Button {
+                Haptics.light()
+                Task { try? await model.patchDevice(d.id, ["enabled": !d.enabled]) }
+            } label: {
+                Label(d.enabled ? "Abruf pausieren" : "Abruf fortsetzen",
+                      systemImage: d.enabled ? "pause.circle" : "play.circle")
+            }
+        }
+    }
+}
+
 struct DeviceRow: View {
     @Environment(AppModel.self) private var model
     let device: Device
@@ -108,6 +148,7 @@ struct DeviceRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(device.name).font(.headline).lineLimit(1)
+                    if device.net != .apple { tag(device.net.label.uppercased(), device.net.color) }
                     if device.lost.enabled { tag("VERLOREN", .red) }
                     if device.isGuarded { tag("WACHE", .orange) }
                     if !device.enabled { tag("PAUSE", .gray) }
