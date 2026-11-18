@@ -178,7 +178,7 @@ extension AppModel {
 
     func showOnly(_ n: TrackerNetwork?) {
         Haptics.selection()
-        withAnimation(.spring(duration: 0.3)) { networkFilter = n.map { [$0] } ?? Set(TrackerNetwork.allCases) }
+        withAnimation(.spring(duration: 0.3)) { networkFilter = n.map { Set([$0]) } ?? Set(TrackerNetwork.allCases) }
     }
 
     /// „Orten“ – je nach Netz: Google zuerst direkt auf dem iPhone, sonst über den Server.
