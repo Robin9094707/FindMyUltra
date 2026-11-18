@@ -4,7 +4,7 @@ Diese Datei liest Claude Code in jeder neuen Sitzung automatisch. Sie fasst Aufb
 
 ## Projekt in einem Satz
 
-`server/findmy_ultra.py` ist eine einzige Python-Datei. Sie ortet die **eigenen** AirTags, Apple-Geräte und AirPods des Nutzers (Wo-ist-Netzwerk über FindMy.py, online über iCloud mit pyicloud), speichert alles in SQLite und stellt API, Web-App und Bark-Alarme bereit. `ios/` ist die passende SwiftUI-App mit Liquid Glass für iOS 26, gebaut per GitHub Action als unsignierte IPA zum Sideloaden.
+`server/findmy_ultra.py` ist eine einzige Python-Datei. Sie ortet die **eigenen** AirTags, Apple-Geräte, AirPods sowie (seit 1.7) Google-Find-Hub- und Samsung-SmartThings-Tracker des Nutzers (Wo-ist-Netzwerk über FindMy.py, online über iCloud mit pyicloud), speichert alles in SQLite und stellt API, Web-App und Bark-Alarme bereit. `ios/` ist die passende SwiftUI-App mit Liquid Glass für iOS 26, gebaut per GitHub Action als unsignierte IPA zum Sideloaden.
 
 Der Nutzer spricht **Deutsch**. UI-Texte, Fehlermeldungen, Commits und Antworten bitte auf Deutsch.
 
@@ -38,6 +38,7 @@ Der Nutzer spricht **Deutsch**. UI-Texte, Fehlermeldungen, Commits und Antworten
 | Apple-Geräte | `apple_device_public` (führt online und offline zusammen, `best`), `airpods_case_status`, `airpods_separation`, `check_case_alerts`, `session_points` |
 | Auswertung | `compute_stays` (Aufenthalte mit Ausreißer-Toleranz) |
 | Benachrichtigung | `Notifier` (Bark, Stufen, Ruhezeit), `Alerts` |
+| Weitere Netze (1.7) | `Samsung` (Login über `ms-app://`-Rückleitung, SmartThings `execute`, ECIES mit Find-PIN), `GoogleServer` (GoogleFindMyTools in `data/google/venv`, `GOOGLE_BRIDGE_SOURCE`, `app_reports`), `networks_summary`, `ingest_network_reports`; Tracker liegen in `devices` mit `network`/`ext_id`, IDs über `network_device_id` |
 | HTTP | `build_app` (aiohttp, Middleware für Auth, alle Routen am Ende), `WEB_HTML` (eingebettete Web-App) |
 
 ### App (`ios/FindMyUltra/`)
@@ -52,6 +53,9 @@ Der Nutzer spricht **Deutsch**. UI-Texte, Fehlermeldungen, Commits und Antworten
 | `Views/AppleDevicesViews.swift` | Geräte-Tab, Gerätedetail, iCloud verbinden |
 | `Views/RecordingViews.swift` | Aufzeichnungen, Timeline, Case-Status-Karte, Datenquellen |
 | `Views/DeviceExtrasViews.swift` | Gerätestatus aus iCloud, Nachricht, Verloren-Modus, Rohdaten, Trennungsanzeige |
+| `Networks.swift` | `GoogleLink` (Spot → Server-Sync, Zugang übergeben), Netz-Filter-Logik, `locate(_:)` |
+| `Views/NetworkViews.swift` | Netz-Filter-Leiste, Google- und Samsung-Seiten, Login-WebViews |
+| `../Vendor/Spot/` | Google-Engine als Framework `SpotIntegration` (aus RJ TrackerApp, GPL-3.0); öffentliche API: `GoogleTrackerStore` |
 | `Views/Components.swift` | Pins, Haptik, Zeitformat (`findMyTime`, `ageColor`), Glas-Bausteine |
 
 Navigation im Sheet: `model.sheetPath: [DeviceRoute]` mit den Flags `apple` und `recording`.
@@ -75,6 +79,8 @@ Navigation im Sheet: `model.sheetPath: [DeviceRoute]` mit den Flags `apple` und 
 - **FindMy.py `_login_mobileme()`** darf nur im Status AUTHENTICATED aufgerufen werden. Zum Auffrischen erst `_gsa_authenticate()`.
 - **iOS-Dateiauswahl:** Statt SwiftUI-`fileImporter` den eigenen `DocumentPicker` nutzen (`asCopy: true`, alle Dateitypen). Sonst blieb „Öffnen“ ausgegraut. Zusätzlich gibt es das Einfügen aus der Zwischenablage.
 - **Dieselbe Schlüsseldatei** darf nicht gleichzeitig Objekt (`item`) und Gerät (`apple_device`) sein. Der Server lehnt das mit 409 ab, damit beim Entfernen nichts verloren geht.
+- **Fremde Netze:** Gelöschte Google-/Samsung-Tracker stehen in `kv.network_ignored`, sonst legt die Synchronisierung sie wieder an. Alle Tracker-Code-Pfade (Apple-Polling, Registry) müssen `network != 'apple'` ignorieren.
+- **Spot-Pakete:** Versionen in `ios/project.yml` exakt lassen (Digest 1.12.0 passt nur zu SwiftECC 5.4.0).
 - **Aufbewahrung:** `Store.purge` schützt Zeiträume von Aufzeichnungen, damit Punkte darin nicht gelöscht werden.
 
 ## Fachliche Hinweise

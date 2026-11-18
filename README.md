@@ -1,11 +1,11 @@
 # FindMy Ultra
 
-Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Geräte und AirPods. Das Projekt besteht aus zwei Teilen:
+Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Geräte und AirPods – und seit 1.7 auch für **Google-Find-Hub-Tracker** und **Samsung Galaxy SmartTags**. Das Projekt besteht aus zwei Teilen:
 
 | Teil | Was | Version |
 |---|---|---|
-| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. | 1.6.0 |
-| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. | 1.6.0 |
+| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.0 |
+| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.0 |
 
 > Das Projekt extrahiert keine Schlüssel. Du importierst deine vorhandenen JSON- oder plist-Schlüsseldateien.
 > Es nutzt inoffizielle Apple-Schnittstellen, die sich jederzeit ändern können. Verwende es nur für deine eigenen Geräte.
@@ -18,6 +18,7 @@ Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Ger
 - [Server](#server)
 - [iOS-App installieren](#ios-app-installieren)
 - [Funktionen](#funktionen)
+- [Google & Samsung (1.7)](#google--samsung-17)
 - [Firewall / Netzwerk](#firewall--netzwerk)
 - [API](#api)
 - [Aufbau des Repos](#aufbau-des-repos)
@@ -157,6 +158,31 @@ Unter der Server-Adresse findest du Karte, Verlauf mit Zeitleiste, Apple-Login, 
 
 ---
 
+## Google & Samsung (1.7)
+
+Neben Apple gibt es jetzt zwei weitere **Ortungsnetze**. Alle Tracker landen als normale Objekte in der Datenbank: Karte, Verlauf, Aufenthalte, Alarme, Verloren-Modus, Wache und Export funktionieren für jedes Netz gleich. **Vorhandene Daten bleiben unverändert** – die Datenbank bekommt nur zwei neue Spalten (`network`, `ext_id`), bestehende Objekte gelten als „Apple“.
+
+**Netz-Filter:** In der Objektliste wählst du oben *Alle · Apple · Google · Samsung* (gedrückt halten = zusätzlich ein-/ausblenden). Auch im Karten-Menü (oben rechts) lassen sich die Netze einzeln zeigen. Pins von Google- und Samsung-Trackern tragen ein kleines G- bzw. S-Abzeichen. Unter **Ich → Netzwerke** lässt sich jedes Netz ganz ein- oder ausschalten.
+
+### Google Find Hub – direkt auf dem iPhone
+
+1. **Ich → Netzwerke → Google → „Bei Google anmelden“.** Die Anmeldung läuft auf der echten Google-Seite in der App. Token und Schlüssel bleiben im Schlüsselbund des iPhones.
+2. **„Schlüssel entsperren“** mit der Displaysperre (PIN/Muster) eines deiner Android-Geräte. Erst dann lassen sich Standorte entschlüsseln.
+3. Die App ortet deine Tracker, entschlüsselt die Standorte lokal und schickt sie an deinen Server („Standorte an den Server senden“, Standard: an). Optional: **„Gesammelten Verlauf mitsenden“** und pro Tracker **„Automatisch orten & Verlauf sammeln“**.
+4. Alternativ: vorhandene `secrets.json` (GoogleFindMyTools) importieren.
+
+**Fallbacks:** Antwortet Google im Modus „Adaptiv“ nicht, fragt die Engine automatisch „Alle Bereiche“ an. Bekommt die App gar keine Antwort, ortet der **Server** (wenn eingerichtet). Dafür in der App **„Zugang an Server übergeben“** tippen (oder eine `secrets.json` hochladen) – der Server lädt dann einmalig [GoogleFindMyTools](https://github.com/leonboe1/GoogleFindMyTools) in eine eigene Python-Umgebung (`data/google/`, braucht `python3-venv`, dauert ein paar Minuten). Modus *Automatisch*: Der Server ortet nur, wenn die App 30 Minuten nichts geliefert hat (z. B. iPhone im Hintergrund). *Immer* oder *Aus* sind ebenfalls wählbar.
+
+### Samsung SmartThings Find
+
+1. **Ich → Netzwerke → Samsung → „Mit Samsung-Konto anmelden“.** Die Samsung-Login-Seite öffnet sich in der App. Die Rückleitung (`ms-app://…`) wird automatisch abgefangen, der Server schließt die Anmeldung ab und lädt alle SmartTags. Bleibt sie hängen: Login in Safari öffnen und die `ms-app://`-Adresse unten einfügen.
+2. Ist in SmartThings „Standorte verschlüsseln“ aktiv, die **Samsung-Find-PIN** eintragen.
+3. Optional **„Standortverlauf von Samsung laden“**: Der Server holt zusätzlich die bei Samsung gespeicherten Standorte der letzten 7 Tage, damit nach einer Server-Pause keine Punkte fehlen. Abruf-Intervall einstellbar (Standard 2 Minuten).
+
+Zugangsdaten liegen nur auf deinem Server (`data/samsung/`, `data/google/`, Rechte 600). Ein entfernter Google-/Samsung-Tracker wird bei der nächsten Synchronisierung nicht wieder angelegt; „Alle Tracker wieder anzeigen“ holt ihn zurück.
+
+---
+
 ## Firewall / Netzwerk
 
 Der Server braucht fast nur **ausgehendes HTTPS (TCP 443)**.
@@ -170,6 +196,10 @@ Der Server braucht fast nur **ausgehendes HTTPS (TCP 443)**.
 | ausgehend | `api.day.app` oder eigener Bark-Server | 443 | Push-Benachrichtigungen |
 | ausgehend | `nominatim.openstreetmap.org` | 443 | Adressen in Mitteilungen (optional) |
 | ausgehend | `pypi.org`, `files.pythonhosted.org` | 443 | Installation und Updates der Pakete |
+| ausgehend | `account.samsung.com`, `*.samsungosp.com` (Auth-Server), `api.smartthings.com`, `client.smartthings.com` | 443 | Samsung SmartThings Find (1.7) |
+| ausgehend | `android.clients.google.com`, `android.googleapis.com`, `spot-pa.googleapis.com`, `firebaseinstallations.googleapis.com`, `fcmregistrations.googleapis.com` | 443 | Google Find Hub, Server-Fallback (1.7) |
+| ausgehend | `mtalk.google.com` | **5228** TCP | Google-Antworten (FCM-Push) für den Server-Fallback |
+| ausgehend | `github.com`, `codeload.github.com` | 443 | einmaliger Download von GoogleFindMyTools |
 | ausgehend | DNS 53, NTP 123 | UDP | Namensauflösung, genaue Uhrzeit für 2FA |
 
 Am einfachsten erlaubst du **17.0.0.0/8 ausgehend auf 443**, das ist der IP-Bereich von Apple. Nimm `*.icloud.com` außerdem von einer **TLS-Inspektion** aus, sonst schlägt die Zertifikatsprüfung fehl. Fehlt IPv6, fällt der Server automatisch auf IPv4 zurück.
@@ -189,6 +219,7 @@ Alle Aufrufe brauchen `Authorization: Bearer <token>` (aus `POST /api/auth/login
 | Apple-Geräte | `GET/POST /api/apple-devices` · `POST /api/apple-devices/refresh` · `PATCH/DELETE /api/apple-devices/{id}` · `POST …/{id}/offline?role=main\|left\|right\|case` · `DELETE …/{id}/offline/{role}` · `POST …/{id}/sound` · `…/message` · `…/lost` · `GET …/{id}/raw` |
 | Aufzeichnungen | `GET/POST /api/apple-devices/{id}/sessions` · `GET /api/sessions/{sid}/points` · `POST /api/sessions/{sid}/stop` · `PATCH/DELETE /api/sessions/{sid}` |
 | iCloud | `POST /api/icloud/connect` · `/2fa/sms` · `/2fa/submit` · `/disconnect` |
+| Netze | `GET /api/networks` · Samsung: `POST /api/samsung/login` · `/complete` · `/logout` · `/sync` · `/refresh` · `POST/DELETE /api/samsung/pin` · Google: `POST/DELETE /api/google/secrets` · `POST /api/google/setup` · `/sync` · `/refresh` · `/app-reports` |
 | Export | `GET /export.gpx` · `/export.csv` · `/export.json` (`?since=&until=&device=`) |
 
 Geräte-IDs von Apple enthalten `/`, `+` und `=`. Kodiere sie im Pfad (z. B. `%2F`).
@@ -205,7 +236,9 @@ ios/
   project.yml            # XcodeGen-Projekt
   FindMyUltra/           # SwiftUI-App (Liquid Glass, iOS 26)
     AppModel.swift, APIClient.swift, Models.swift
-    Views/               # Karte, Objekte, Geräte, Aufzeichnungen, Einstellungen …
+    Networks.swift       # Google-Sync (iPhone → Server), Netz-Filter
+    Views/               # Karte, Objekte, Geräte, Aufzeichnungen, Netzwerke, Einstellungen …
+  Vendor/Spot/           # Google-Find-Hub-Engine (Spot, GPL-3.0) als Framework
 .github/workflows/ios.yml  # baut die unsignierte IPA (macos-26 + macos-15)
 ```
 
@@ -220,4 +253,9 @@ ios/
 | Online-Ortung: Zertifikatsfehler | TLS-Inspektion der Firewall für `*.icloud.com` abschalten. |
 | Online-Ortung: Sitzung abgelaufen | Geräte → „Online-Ortung verbinden“ und den Code erneut bestätigen. |
 | Import zeigt „bereits als Objekt importiert“ | Dieselbe Schlüsseldatei kann nicht gleichzeitig Objekt und Gerät sein. Entferne zuerst das Objekt. |
+| Samsung: „SmartThings Find ist nicht aktiv“ | Einmal in der SmartThings-App den Bereich „Find“ öffnen, dann „Geräteliste neu laden“. |
+| Samsung: keine Standorte, „PIN nötig“ | Samsung-Find-PIN unter Netzwerke → Samsung eintragen. |
+| Google: „Schlüssel noch gesperrt“ | „Schlüssel entsperren“ und die Displaysperre eines Android-Geräts eingeben. |
+| Google-Server-Ortung: Einrichtung schlägt fehl | `python3-venv` installieren, Firewall für `github.com`/`pypi.org` prüfen, dann „Server-Ortung einrichten“. |
+| Google-Server: „Zugang abgelehnt“ | In der App neu bei Google anmelden und „Zugang an Server übergeben“. |
 | Zugangsdaten vergessen | `server/data/credentials.json` löschen und den Server neu starten. |

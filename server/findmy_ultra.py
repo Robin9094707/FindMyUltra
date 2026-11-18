@@ -5379,7 +5379,7 @@ function initMap(){if(map)return;map=L.map('map',{zoomControl:false,attributionC
 function icon(d){return L.divIcon({className:'',html:`<div class="marker" style="background:${d.color}">${d.emoji||'📍'}</div>`,iconSize:[38,38],iconAnchor:[19,19]})}
 function render(){const l=$('#list');l.innerHTML='';
   for(const d of devices){const e=document.createElement('div');e.className='dev'+(sel===d.id?' sel':'');const last=d.last;
-    e.innerHTML=`<div class="emo" style="background:${d.color}33">${d.emoji||'📍'}</div><div class="t"><div class="n">${esc(d.name)}${d.lost.enabled?'<span class="tag lost">VERLOREN</span>':''}${d.alerts.guard.enabled?'<span class="tag guard">WACHE</span>':''}</div>
+    e.innerHTML=`<div class="emo" style="background:${d.color}33">${d.emoji||'📍'}</div><div class="t"><div class="n">${esc(d.name)}${d.network&&d.network!=='apple'?`<span class="tag" style="background:${d.network==='google'?'#34a853':'#1428a0'}">${d.network==='google'?'GOOGLE':'SAMSUNG'}</span>`:''}${d.lost.enabled?'<span class="tag lost">VERLOREN</span>':''}${d.alerts.guard.enabled?'<span class="tag guard">WACHE</span>':''}</div>
     <div class="s">${last?ago(last.ts)+' · ±'+(last.accuracy??'?')+' m':'noch kein Standort'} ${d.battery?bat[d.battery]:''} · ${d.total} Pkt.</div></div>`;
     e.onclick=()=>select(d.id);l.appendChild(e);
     if(last){const ll=[last.lat,last.lon];if(!layers[d.id]){layers[d.id]={m:L.marker(ll,{icon:icon(d)}).addTo(map).on('click',()=>select(d.id)),c:L.circle(ll,{radius:last.accuracy||10,color:d.color,weight:1,fillOpacity:.12}).addTo(map)}}
