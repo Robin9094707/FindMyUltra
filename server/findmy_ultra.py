@@ -5,7 +5,8 @@ FindMy Ultra – Server
 
 Eine einzige Python-Datei, die die Standortberichte deiner **eigenen** AirTags
 und Wo-ist-Zubehörteile direkt bei Apple abholt (über FindMy.py), lückenlos in
-SQLite speichert und per HTTP-API + Web-App bereitstellt. Die iOS-App
+SQLite speichert und per HTTP-API + Web-App bereitstellt. Seit 1.7 zusätzlich
+Google-Find-Hub- und Samsung-SmartThings-Find-Tracker (eigene Konten). Die iOS-App
 „FindMy Ultra“ koppelt sich an diesen Server.
 
 Funktionen
@@ -117,7 +118,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -213,6 +214,21 @@ DEFAULT_SETTINGS: dict = {
     "online_devices": {           # Online-Ortung der Apple-Geräte (iCloud „Wo ist?“)
         "enabled": True,
         "interval": 120,          # s zwischen Abfragen
+    },
+    "networks": {                 # Ortungsnetze (in der App einzeln auswählbar)
+        "apple": {"enabled": True},
+        "google": {
+            "enabled": True,
+            "server_mode": "auto",    # auto = Server ortet nur, wenn die App länger nichts geliefert hat
+                                      # always = Server ortet immer · off = nur die App
+            "interval": 900,          # s zwischen Server-Ortungen (min. 300)
+            "app_grace_min": 30,      # so lange gilt eine App-Lieferung als „frisch“
+        },
+        "samsung": {
+            "enabled": True,
+            "interval": 120,          # s zwischen Abrufen (min. 30)
+            "history": False,         # optional: Standortverlauf von Samsung (bis 7 Tage) mit abrufen
+        },
     },
     "stays": {                    # Aufenthalte / stationäre Orte
         "radius_m": 120,          # max. Abstand zum Mittelpunkt, um als „gleicher Ort“ zu zählen
@@ -385,6 +401,10 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(devices)")}
         if "category" not in cols:
             self.db.execute("ALTER TABLE devices ADD COLUMN category TEXT NOT NULL DEFAULT 'item'")
+        if "network" not in cols:   # 1.7: apple | google | samsung
+            self.db.execute("ALTER TABLE devices ADD COLUMN network TEXT NOT NULL DEFAULT 'apple'")
+        if "ext_id" not in cols:    # 1.7: ID des Trackers im fremden Netz
+            self.db.execute("ALTER TABLE devices ADD COLUMN ext_id TEXT")
         acols = {r[1] for r in self.db.execute("PRAGMA table_info(apple_devices)")}
         if "settings" not in acols:
             self.db.execute("ALTER TABLE apple_devices ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")
@@ -487,6 +507,27 @@ class Store:
             d.pop("state", None)
             out.append(d)
         return out
+
+    def upsert_network_device(self, network: str, ext_id: str, name: str, model: str | None,
+                              kind: str) -> tuple[str, bool]:
+        """Tracker eines fremden Netzes anlegen bzw. aktualisieren (Name bleibt, falls umbenannt)."""
+        did = network_device_id(network, ext_id)
+        new = not self.device_row(did)
+        if new:
+            self.upsert_device(did, name, model, None, None, kind)
+            self.db.execute("UPDATE devices SET network=?, ext_id=? WHERE id=?", (network, ext_id, did))
+            if network != "apple":
+                alerts = copy.deepcopy(DEFAULT_ALERTS)
+                self.db.execute("UPDATE devices SET alerts=? WHERE id=?", (json.dumps(alerts), did))
+            self.db.commit()
+        elif model:
+            self.db.execute("UPDATE devices SET model=? WHERE id=?", (model, did))
+            self.db.commit()
+        return did, new
+
+    def network_devices(self, network: str) -> list[dict]:
+        rows = self.db.execute("SELECT * FROM devices WHERE network=? ORDER BY sort", (network,)).fetchall()
+        return [self._dev(r) for r in rows]
 
     def device_public(self, dev_id: str) -> dict | None:
         return next((d for d in self.devices() if d["id"] == dev_id), None)
@@ -2342,7 +2383,8 @@ class Alerts:
                     await self.st.notifier.notify(
                         device=dev, kind="battery", level=a["battery"].get("level", "active"),
                         title=f"🔋 {name}: Batterie {'kritisch' if b == 'critical' else 'schwach'}",
-                        body="Bitte bald die Knopfzelle (CR2032) tauschen.")
+                        body="Bitte bald die Knopfzelle (CR2032) tauschen." if dev.get("network") in (None, "apple", "samsung")
+                        else "Bitte den Tracker bald aufladen bzw. die Batterie tauschen.")
         if changed:
             self.st.store.update_device(dev_id, state=state)
 
@@ -2366,6 +2408,1522 @@ class Alerts:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Weitere Netze: Samsung SmartThings Find & Google Find Hub
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Tracker aus Google Find Hub und Samsung SmartThings Find werden als ganz
+# normale Objekte in `devices` (Spalte `network`) mit Berichten in `reports`
+# gespeichert. Karte, Verlauf, Aufenthalte, Alarme und Export funktionieren
+# dadurch für alle Netze gleich. Übernommen und angepasst aus RJ TrackerApp.
+
+NETWORKS = ("apple", "google", "samsung")
+NETWORK_LABEL = {"apple": "Apple „Wo ist?“", "google": "Google Find Hub", "samsung": "Samsung SmartThings Find"}
+
+
+def network_device_id(network: str, ext_id: str) -> str:
+    """Stabile, URL-sichere Objekt-ID für einen Tracker eines fremden Netzes."""
+    return f"{network[0]}-" + hashlib.sha1(f"{network}|{ext_id}".encode()).hexdigest()[:20]
+
+
+def _private_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text("utf-8")) if path.exists() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_private_json(path: Path, data: dict) -> None:
+    secure_write(path, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def mask_account(s: str | None) -> str:
+    s = str(s or "")
+    if not s:
+        return ""
+    if "@" not in s:
+        return (s[:2] + "•••") if len(s) > 2 else "•••"
+    local, domain = s.split("@", 1)
+    return f"{local[:2]}•••@{domain}"
+
+
+class NetworkError(RuntimeError):
+    def __init__(self, msg: str, status: int = 0, payload: dict | None = None) -> None:
+        super().__init__(msg)
+        self.status = status
+        self.payload = payload or {}
+
+
+def http_json(url: str, method: str = "GET", headers: dict | None = None, data: Any = None,
+              timeout: float = 45, form: bool = False) -> dict:
+    """Kleiner, synchroner JSON-Client (läuft per asyncio.to_thread)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    h = {"Accept": "application/json", "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
+         "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8 Pro) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36"}
+    h.update(headers or {})
+    body = None
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+            h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(8 * 1024 * 1024)
+            out = json.loads(raw.decode("utf-8")) if raw else {}
+            return out if isinstance(out, dict) else {"items": out}
+    except urllib.error.HTTPError as e:
+        raw = e.read(2 * 1024 * 1024)
+        try:
+            p = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:  # noqa: BLE001
+            p = {"message": raw.decode("utf-8", "replace")[:300]}
+        if not isinstance(p, dict):
+            p = {"message": str(p)[:300]}
+        msg = p.get("message") or p.get("error_description") or p.get("error") or f"HTTP {e.code}"
+        raise NetworkError(str(msg)[:300], e.code, p) from None
+    except urllib.error.URLError as e:
+        raise NetworkError(f"Dienst nicht erreichbar ({e.reason}) – Firewall/Internet prüfen") from None
+
+
+def network_ignored(store: "Store", network: str) -> set[str]:
+    return set((store.kv_get("network_ignored", {}) or {}).get(network, []))
+
+
+def set_network_ignored(store: "Store", network: str, ext_id: str | None, ignored: bool = True,
+                        clear: bool = False) -> None:
+    data = store.kv_get("network_ignored", {}) or {}
+    cur = set(data.get(network, []))
+    if clear:
+        cur = set()
+    elif ext_id:
+        (cur.add if ignored else cur.discard)(ext_id)
+    data[network] = sorted(cur)
+    store.kv_set("network_ignored", data)
+
+
+async def ingest_network_reports(st: "State", dev_id: str, items: list[dict]) -> int:
+    """Neue Berichte speichern, live melden und Alarme auswerten."""
+    items = [i for i in items if -90 <= float(i["lat"]) <= 90 and -180 <= float(i["lon"]) <= 180]
+    if not items:
+        return 0
+    prev = st.store.newest_ts(dev_id)
+    new = st.store.insert_reports(dev_id, items)
+    if new:
+        st.hub.publish("reports", {"device_id": dev_id, "reports": new})
+        with contextlib.suppress(Exception):
+            await st.alerts.on_reports(dev_id, new, prev)
+    return len(new)
+
+
+# ── Samsung SmartThings Find ──────────────────────────────────────────────────
+
+SAMSUNG_LOGIN_CLIENT_ID = "yfrtglt53o"
+SAMSUNG_SMARTTHINGS_CLIENT_ID = "6iado3s6jc"
+SAMSUNG_FIND_CLIENT_ID = "27zmg0v1oo"
+SAMSUNG_SMARTTHINGS_SCOPE = "iot.client"
+SAMSUNG_FIND_SCOPE = "offline.access"
+SAMSUNG_REDIRECT_URI = "ms-app://s-1-15-2-4027708247-2189610-1983755848-2937435718-1578786913-2158692839-1974417358"
+SAMSUNG_ENTRYPOINT_URL = "https://account.samsung.com/accounts/ANDROIDSDK/getEntryPoint"
+SAMSUNG_INSTALLED_APPS_URL = "https://api.smartthings.com/installedapps?allowed=true"
+SAMSUNG_CLIENT_DEVICES_URL = ("https://client.smartthings.com/devices?includeAllowedActions=true&includeMfuLocations=true"
+                              "&includeUserDevices=false&excludeLocationDevices=false&includeGroups=true"
+                              "&includeHidden=true&exclusiveToHidden=false")
+SAMSUNG_TAG_OCF_TYPE = "x.com.st.d.tag"
+SAMSUNG_PLUGIN_ID = "com.samsung.android.plugin.fme"
+SAMSUNG_ST_VERSION = os.environ.get("FMU_SMARTTHINGS_VERSION", "1.8.47.24")
+SAMSUNG_BATTERY = {"FULL": "full", "MEDIUM": "medium", "LOW": "low", "VERY_LOW": "critical",
+                   "03": "full", "02": "medium", "01": "low", "00": "critical"}
+
+
+def _rand(n: int) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def _pkce(verifier: str) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+
+
+class Samsung:
+    """
+    Galaxy SmartTags über das eigene Samsung-Konto (SmartThings Find).
+    Anmeldung: Login-Seite von Samsung (in der App), die Rückleitung „ms-app://…“
+    wird abgefangen und hier entschlüsselt. Ende-zu-Ende-verschlüsselte Standorte
+    werden mit der Samsung-Find-PIN entschlüsselt.
+    """
+
+    def __init__(self, st: "State") -> None:
+        self.st = st
+        self.dir = DATA_DIR / "samsung"
+        self.auth = _private_json(self.dir / "auth.json")
+        self.pin = str(_private_json(self.dir / "pin.json").get("pin") or "")
+        self.error: str | None = None
+        self.pin_required = False
+        self.last_refresh: float | None = None
+        self.last_sync: float | None = None
+        self.last_count = 0
+        self.failures = 0
+        self.event = asyncio.Event()
+        self.alock = asyncio.Lock()
+        self._tlock = __import__("threading").Lock()
+
+    # Zustand ------------------------------------------------------------------
+    @property
+    def connected(self) -> bool:
+        return bool(self.auth.get("userauth_token"))
+
+    def cfg(self) -> dict:
+        return self.st.store.settings()["networks"]["samsung"]
+
+    def status(self) -> dict:
+        pending = _private_json(self.dir / "pending.json")
+        c = self.cfg()
+        return {"network": "samsung", "enabled": bool(c.get("enabled")), "connected": self.connected,
+                "account": mask_account(self.auth.get("login_id")), "pin": bool(self.pin),
+                "pin_required": self.pin_required, "history": bool(c.get("history")),
+                "interval": int(c.get("interval", 120)), "error": self.error,
+                "last_refresh": self.last_refresh, "last_sync": self.last_sync,
+                "devices": len(self.st.store.network_devices("samsung")),
+                "login_pending": bool(pending) and int(pending.get("created_ts", 0)) > now() - 1800}
+
+    def _save_auth(self) -> None:
+        _save_private_json(self.dir / "auth.json", self.auth)
+
+    # Anmeldung ------------------------------------------------------------------
+    def login_url(self) -> str:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import padding as apad
+        entry = http_json(SAMSUNG_ENTRYPOINT_URL, timeout=20)
+        public_key = serialization.load_der_public_key(base64.b64decode(entry["pkiPublicKey"]))
+        check = str(entry["chkDoNum"])
+        state_key, verifier = _rand(20), _rand(43)
+        android_id = str(self.auth.get("android_id") or secrets.token_hex(8))
+        svc = {"birthDate": None, "clientId": SAMSUNG_LOGIN_CLIENT_ID, "code_challenge": _pkce(verifier),
+               "code_challenge_method": "S256", "competitorDeviceYNFlag": "Y", "countryCode": "de",
+               "deviceInfo": "Google|com.android.chrome", "deviceModelID": "Pixel 8 Pro",
+               "deviceName": "Google Pixel 8 Pro", "deviceOSVersion": "35",
+               "devicePhysicalAddressText": f"ANID:{android_id}", "deviceType": "APP",
+               "deviceUniqueID": android_id, "redirect_uri": SAMSUNG_REDIRECT_URI,
+               "replaceableClientConnectYN": "N", "replaceableClientId": "",
+               "replaceableDevicePhysicalAddressText": "", "responseEncryptionType": "1",
+               "responseEncryptionYNFlag": "Y", "scope": "", "state": state_key, "svcIptLgnID": "",
+               "iosYNFlag": "Y"}
+        salt = secrets.token_bytes(16)
+        password = base64.b64encode(hashlib.sha256(check.encode()).digest())
+        key = hashlib.pbkdf2_hmac("sha256", password, salt, int(check), dklen=16)
+        enc_key = public_key.encrypt(base64.b64encode(key), apad.PKCS1v15())
+        iv = secrets.token_bytes(16)
+        payload = self._aes_cbc(key, iv, json.dumps(svc, ensure_ascii=False, separators=(",", ":")).encode())
+        envelope = {"chkDoNum": check, "svcEncParam": base64.b64encode(payload).decode(),
+                    "svcEncKY": base64.b64encode(enc_key).decode(), "svcEncIV": iv.hex()}
+        encoded = quote(base64.b64encode(json.dumps(envelope, separators=(",", ":")).encode()).decode(), safe="")
+        url = f"{entry['signInURI']}?locale=de-DE&svcParam={encoded}&mode=C"
+        _save_private_json(self.dir / "pending.json", {"state": state_key, "code_verifier": verifier,
+                                                       "android_id": android_id, "created_ts": int(now())})
+        self.auth.setdefault("android_id", android_id)
+        if self.auth:
+            self._save_auth()
+        return url
+
+    @staticmethod
+    def _aes_cbc(key: bytes, iv: bytes, value: bytes) -> bytes:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        p = PKCS7(128).padder()
+        e = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        return e.update(p.update(value) + p.finalize()) + e.finalize()
+
+    @staticmethod
+    def _ecb_hex(value: str, key_text: str) -> str:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        key = str(key_text).encode()[:16].ljust(16, b"0")
+        d = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+        u = PKCS7(128).unpadder()
+        padded = d.update(bytes.fromhex(str(value))) + d.finalize()
+        return (u.update(padded) + u.finalize()).decode()
+
+    @staticmethod
+    def _osp_headers() -> dict:
+        return {"X-Osp-Clientosversion": "35", "X-Osp-Clientmodel": "Pixel 8 Pro",
+                "X-Osp-Appid": SAMSUNG_LOGIN_CLIENT_ID, "X-Osp-Packagename": "com.samsung.android.oneconnect",
+                "X-Osp-Packageversion": SAMSUNG_ST_VERSION,
+                "User-Agent": f"OneConnect/{SAMSUNG_ST_VERSION} (Android 15; Pixel 8 Pro)"}
+
+    @staticmethod
+    def _base(auth: dict) -> str:
+        b = str(auth.get("auth_server_url") or "").rstrip("/")
+        return b if b.startswith("https://") else "https://" + b
+
+    def _exchange(self, auth: dict, client_id: str, scope: str) -> dict:
+        import urllib.parse
+        verifier = _rand(43)
+        params = {"response_type": "code", "serviceType": "M", "client_id": client_id,
+                  "code_challenge_method": "S256", "childAccountSupported": "Y",
+                  "userauth_token": auth["userauth_token"], "code_challenge": _pkce(verifier),
+                  "physical_address_text": auth["android_id"], "scope": scope, "login_id": auth.get("login_id") or ""}
+        base = self._base(auth)
+        r = http_json(base + "/auth/oauth2/v2/authorize?" + urllib.parse.urlencode(params),
+                      headers=self._osp_headers(), timeout=30)
+        if not r.get("code") and r.get("privacyAccepted") == "N":
+            params.pop("login_id", None)
+            r = http_json(base + "/auth/oauth2/v2/authorize?" + urllib.parse.urlencode(params),
+                          headers=self._osp_headers(), timeout=30)
+        if not r.get("code"):
+            raise NetworkError("Samsung hat keinen API-Autorisierungscode geliefert.")
+        return http_json(base + "/auth/oauth2/token", "POST", self._osp_headers(), form=True, timeout=30, data={
+            "grant_type": "authorization_code", "code": r["code"], "client_id": client_id,
+            "code_verifier": verifier, "physical_address_text": auth["android_id"]})
+
+    def complete_login(self, redirect: str) -> dict:
+        from urllib.parse import parse_qs
+        pending = _private_json(self.dir / "pending.json")
+        if not pending or int(pending.get("created_ts", 0)) < now() - 1800:
+            raise NetworkError("Der Samsung-Login ist abgelaufen. Bitte neu starten.")
+        value = str(redirect or "").strip()
+        if "?" not in value:
+            value = "ms-app://callback?" + value.lstrip("?")
+        q = parse_qs(urlparse(value).query)
+        enc = {k: (q.get(k) or [""])[0] for k in ("state", "code", "auth_server_url", "retValue")}
+        if not all(enc.values()):
+            raise NetworkError("Die Samsung-Rückleitung enthält nicht alle Anmeldedaten.")
+        rk = self._ecb_hex(enc["state"], pending["state"])
+        code = self._ecb_hex(enc["code"], rk)
+        auth_url = self._ecb_hex(enc["auth_server_url"], rk)
+        login_id = self._ecb_hex(enc["retValue"], rk)
+        auth = {"android_id": pending["android_id"], "auth_server_url": auth_url, "login_id": login_id}
+        r = http_json(self._base(auth) + "/auth/oauth2/authenticate", "POST", self._osp_headers(), form=True,
+                      timeout=30, data={"grant_type": "authorization_code", "serviceType": "M", "code": code,
+                                        "client_id": SAMSUNG_LOGIN_CLIENT_ID,
+                                        "code_verifier": pending["code_verifier"], "username": login_id,
+                                        "physical_address_text": pending["android_id"]})
+        if not r.get("userauth_token") or not r.get("userId"):
+            raise NetworkError("Samsung hat keine dauerhafte Kontoberechtigung geliefert.")
+        auth.update(userauth_token=r["userauth_token"], user_id=r["userId"], connected_ts=int(now()))
+        iot = self._exchange(auth, SAMSUNG_SMARTTHINGS_CLIENT_ID, SAMSUNG_SMARTTHINGS_SCOPE)
+        find = self._exchange(auth, SAMSUNG_FIND_CLIENT_ID, SAMSUNG_FIND_SCOPE)
+        auth.update(iot_token=iot.get("access_token"), iot_refresh_token=iot.get("refresh_token"),
+                    find_token=find.get("access_token"), find_refresh_token=find.get("refresh_token"),
+                    token_updated_ts=int(now()), installed_app_id="")
+        self.auth = auth
+        self._save_auth()
+        with contextlib.suppress(FileNotFoundError):
+            (self.dir / "pending.json").unlink()
+        self.error = None
+        self.failures = 0
+        return auth
+
+    def logout(self) -> None:
+        self.auth = {}
+        self.pin = ""
+        self.pin_required = False
+        for f in ("auth.json", "pending.json", "pin.json"):
+            with contextlib.suppress(FileNotFoundError):
+                (self.dir / f).unlink()
+
+    def set_pin(self, pin: str | None) -> None:
+        self.pin = str(pin or "").strip()
+        if self.pin:
+            _save_private_json(self.dir / "pin.json", {"pin": self.pin})
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                (self.dir / "pin.json").unlink()
+
+    # API ------------------------------------------------------------------------
+    def _refresh_token(self) -> str:
+        with self._tlock:
+            auth = dict(self.auth)
+            if not auth.get("userauth_token"):
+                raise NetworkError("Samsung-Konto ist nicht verbunden.")
+            token = None
+            if auth.get("iot_refresh_token"):
+                with contextlib.suppress(Exception):
+                    token = http_json(self._base(auth) + "/auth/oauth2/token", "POST", self._osp_headers(),
+                                      form=True, timeout=30,
+                                      data={"grant_type": "refresh_token", "client_id": SAMSUNG_SMARTTHINGS_CLIENT_ID,
+                                            "refresh_token": auth["iot_refresh_token"]})
+            if not token or not token.get("access_token"):
+                token = self._exchange(auth, SAMSUNG_SMARTTHINGS_CLIENT_ID, SAMSUNG_SMARTTHINGS_SCOPE)
+            auth["iot_token"] = token.get("access_token")
+            auth["iot_refresh_token"] = token.get("refresh_token") or auth.get("iot_refresh_token")
+            auth["token_updated_ts"] = int(now())
+            self.auth = auth
+            self._save_auth()
+            return auth["iot_token"]
+
+    def _headers(self, refresh: bool = False) -> dict:
+        token = self.auth.get("iot_token")
+        if refresh or not token:
+            token = self._refresh_token()
+        return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.smartthings+json;v=1",
+                "Accept-Language": "de-DE", "X-St-Client-Appversion": SAMSUNG_ST_VERSION,
+                "X-St-Client-Devicemodel": "Google Pixel 8 Pro husky", "X-St-Client-Os": "Android 15",
+                "X-St-Correlation": secrets.token_hex(16),
+                "User-Agent": f"Android/OneApp/{SAMSUNG_ST_VERSION}/Main (Pixel 8 Pro; Android VANILLA_ICE_CREAM/15) SmartKit/4.423.1"}
+
+    def _get(self, url: str, timeout: float = 45) -> dict:
+        try:
+            return http_json(url, headers=self._headers(), timeout=timeout)
+        except NetworkError as e:
+            if e.status == 401:
+                return http_json(url, headers=self._headers(refresh=True), timeout=timeout)
+            raise
+
+    def _installed_app(self, force: bool = False) -> str:
+        if self.auth.get("installed_app_id") and not force:
+            return self.auth["installed_app_id"]
+        url: str | None = SAMSUNG_INSTALLED_APPS_URL
+        items: list = []
+        while url:
+            r = self._get(url, 30)
+            items += r.get("items", [])
+            url = ((r.get("links") or {}).get("next") or {}).get("href")
+        match = next((i for i in items if (i.get("ui") or {}).get("pluginId") == SAMSUNG_PLUGIN_ID), None)
+        if not match or not match.get("installedAppId"):
+            raise NetworkError("SmartThings Find ist im Samsung-Konto nicht aktiv. Bitte einmal in der "
+                               "SmartThings-App „Find“ öffnen.")
+        self.auth["installed_app_id"] = match["installedAppId"]
+        self._save_auth()
+        return match["installedAppId"]
+
+    def execute(self, method: str, uri: str, extra_uri: str | None = None, extra: dict | None = None) -> dict:
+        app_id = self._installed_app()
+        off = dt.datetime.now().astimezone().utcoffset() or dt.timedelta()
+        mins = int(off.total_seconds() // 60)
+        tz = f"UTC{'+' if mins >= 0 else '-'}{abs(mins) // 60:02d}:{abs(mins) % 60:02d}"
+        params = {"requester": self.auth.get("user_id") or "", "clientType": "aPlugin", "extraUri": extra_uri,
+                  "method": method, "encodedHeaders": "", "requesterToken": self.auth.get("iot_token") or "",
+                  "encodedBody": "", "clientVersion": "1", "uri": uri}
+        params.update({str(k): str(v) for k, v in (extra or {}).items()})
+        payload = {"client": {"displayMode": "DARK", "language": "de-DE",
+                              "mobileDeviceId": self.auth.get("android_id") or "", "os": "Android",
+                              "samsungAccountId": self.auth.get("user_id"),
+                              "supportedTemplates": [f"BASIC_V{i}" for i in range(1, 8)],
+                              "timeZoneOffset": tz, "version": SAMSUNG_ST_VERSION},
+                   "parameters": params}
+        url = f"https://api.smartthings.com/installedapps/{app_id}/execute"
+        try:
+            r = http_json(url, "POST", self._headers(), payload, timeout=60)
+        except NetworkError as e:
+            if e.status == 401:
+                params["requesterToken"] = self._refresh_token()
+                r = http_json(url, "POST", self._headers(), payload, timeout=60)
+            elif e.status in (403, 404):
+                self._installed_app(force=True)
+                r = http_json(url, "POST", self._headers(), payload, timeout=60)
+            else:
+                raise
+        code = int(r.get("statusCode", 200) or 200)
+        if code != 200:
+            raise NetworkError(str(r.get("message") or r.get("errorCode") or f"Samsung-Fehler {code}"))
+        res = r.get("message")
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except Exception:  # noqa: BLE001
+                return {"message": res}
+        return res if isinstance(res, dict) else {}
+
+    @staticmethod
+    def _is_tag(item: dict) -> bool:
+        if str(item.get("ocfDeviceType") or "").strip().lower() == SAMSUNG_TAG_OCF_TYPE:
+            return True
+        caps = [str(c.get("id") or "") for comp in (item.get("components") or []) if isinstance(comp, dict)
+                for c in (comp.get("capabilities") or []) if isinstance(c, dict)]
+        return bool(item.get("bleD2D")) and any(c.startswith("tag.") for c in caps)
+
+    def list_tags(self) -> list[dict]:
+        """Alle SmartTags des Kontos (SmartThings-Geräteliste + Find-Fallbackliste)."""
+        tags: dict[str, dict] = {}
+        client_error = None
+        try:
+            url: str | None = SAMSUNG_CLIENT_DEVICES_URL
+            pages = 0
+            while url and pages < 20:
+                pages += 1
+                r = self._get(url)
+                for it in r.get("items") or []:
+                    if not isinstance(it, dict) or not self._is_tag(it):
+                        continue
+                    did = str(it.get("deviceId") or "").strip()
+                    if not did:
+                        continue
+                    meta = ((it.get("bleD2D") or {}).get("metadata") or {}) if isinstance(it.get("bleD2D"), dict) else {}
+                    vendor = meta.get("vendor") or {}
+                    bat = (meta.get("battery") or {}).get("level")
+                    tags[did] = {"ext_id": did, "name": str(it.get("label") or it.get("name") or "Galaxy SmartTag")[:80],
+                                 "model": str(vendor.get("modelName") or "Galaxy SmartTag")[:80],
+                                 "battery": SAMSUNG_BATTERY.get(str(bat or "").upper())}
+                links = r.get("_links") or r.get("links") or {}
+                nxt = (links.get("next") or {}).get("href") if isinstance(links, dict) else None
+                if nxt and str(nxt).startswith("/"):
+                    nxt = "https://client.smartthings.com" + str(nxt)
+                url = str(nxt) if nxt else None
+        except Exception as e:  # noqa: BLE001
+            client_error = str(e)
+        fme = []
+        with contextlib.suppress(Exception):
+            fme = [i for i in (self.execute("GET", "/devices").get("devices") or []) if isinstance(i, dict)]
+        for it in fme:
+            if str(it.get("locationType") or "").upper() != "TRACKER":
+                continue
+            did = str(it.get("stDid") or "").strip()
+            if did and did not in tags:
+                tags[did] = {"ext_id": did, "name": str(it.get("stDevName") or "Galaxy SmartTag")[:80],
+                             "model": "Galaxy SmartTag", "battery": None}
+        if not tags and client_error and not fme:
+            raise NetworkError(f"SmartThings-Geräteliste nicht lesbar: {client_error}")
+        return list(tags.values())
+
+    # Entschlüsselung (Ende-zu-Ende, Samsung-Find-PIN) -----------------------------
+    @staticmethod
+    def _private_key(pair: dict, pin: str) -> Any:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        priv = str(pair.get("privateKey") or "")
+        iv = str(pair.get("iv") or "")
+        if not priv or not iv or not pin:
+            return None
+        v2 = priv.endswith("_v2")
+        if v2:
+            priv = priv[:-3]
+        material = str(pin) + (str(pair.get("userId") or "") if v2 else "")
+        key = hashlib.sha256(material.encode()).digest()
+        d = Cipher(algorithms.AES(key), modes.CBC(base64.b64decode(iv))).decryptor()
+        padded = d.update(base64.b64decode(priv)) + d.finalize()
+        u = PKCS7(128).unpadder()
+        k = serialization.load_der_private_key(u.update(padded) + u.finalize(), password=None)
+        if not isinstance(k, ec.EllipticCurvePrivateKey):
+            raise ValueError("Samsung-Find-Schlüssel ist kein EC-Schlüssel")
+        return k
+
+    @staticmethod
+    def _ecies(value: Any, key: Any) -> str:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        enc = base64.b64decode(str(value))
+        size = (key.curve.key_size + 7) // 8
+        plen = 1 + 2 * size if enc[:1] == b"\x04" else 1 + size
+        if len(enc) <= plen + 20:
+            raise ValueError("ECIES-Wert zu kurz")
+        eph, ct, mac = enc[:plen], enc[plen:-20], enc[-20:]
+        shared = key.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(key.curve, eph))
+        out, counter, seed = bytearray(), 1, eph + shared
+        while len(out) < len(ct) + 16:
+            out += hashlib.sha1(seed + counter.to_bytes(4, "big")).digest()
+            counter += 1
+        if not hmac.compare_digest(mac, hmac.new(bytes(out[:16]), ct + b"\x00" * 8, hashlib.sha1).digest()):
+            raise ValueError("Samsung-Find-PIN falsch")
+        return bytes(a ^ b for a, b in zip(ct, out[16:])).decode()
+
+    def _point(self, raw: dict, key: Any) -> tuple[dict | None, bool]:
+        encrypted = False
+        try:
+            lat, lon = float(raw.get("latitude")), float(raw.get("longitude"))
+        except (TypeError, ValueError):
+            encrypted = True
+            if key is None:
+                return None, True
+            try:
+                lat, lon = float(self._ecies(raw.get("latitude"), key)), float(self._ecies(raw.get("longitude"), key))
+            except Exception:  # noqa: BLE001
+                return None, True
+        try:
+            ts = float(raw.get("lastUpdateTime") or now())
+            ts = ts / 1000 if ts > 1e11 else ts
+            acc = max(0.0, float(raw.get("accuracy") or 0))
+        except (TypeError, ValueError):
+            return None, False
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None, encrypted
+        return {"ts": round(ts, 3), "lat": round(lat, 7), "lon": round(lon, 7), "accuracy": int(acc),
+                "battery": SAMSUNG_BATTERY.get(str(raw.get("battery") or "").upper())}, False
+
+    def fetch(self, ext_id: str, history_start: float | None) -> tuple[list[dict], bool]:
+        cur = self.execute("GET", "/trackers/geolocation", extra={"stDids": ext_id})
+        pair = next((p for p in cur.get("keyPairs") or [] if isinstance(p, dict) and p.get("privateKey")), None)
+        key = None
+        if pair and self.pin:
+            with contextlib.suppress(Exception):
+                key = self._private_key(pair, self.pin)
+        raws = [g for it in cur.get("items") or [] if str(it.get("deviceId")) == ext_id
+                for g in it.get("geolocations") or []]
+        if history_start:
+            end = int(now() * 1000)
+            with contextlib.suppress(Exception):
+                h = self.execute("GET", "/trackerapi",
+                                 extra_uri=f"/trackers/{quote(ext_id, safe='')}/geolocations?order=asc&isSummary=false"
+                                           f"&startTime={int(history_start * 1000)}&endTime={end}&limit=500")
+                raws += h.get("geolocations") or []
+        items, pin_needed = [], False
+        for raw in raws:
+            if not isinstance(raw, dict):
+                continue
+            p, enc = self._point(raw, key)
+            pin_needed = pin_needed or enc
+            if p:
+                items.append(p)
+        return items, pin_needed
+
+    # Abläufe ----------------------------------------------------------------------
+    async def sync(self, restore: bool = False) -> dict:
+        tags = await asyncio.to_thread(self.list_tags)
+        if restore:
+            set_network_ignored(self.st.store, "samsung", None, clear=True)
+        ignored = network_ignored(self.st.store, "samsung")
+        added = 0
+        for t in tags:
+            if t["ext_id"] in ignored:
+                continue
+            _, new = self.st.store.upsert_network_device("samsung", t["ext_id"], t["name"], t["model"], "tag")
+            added += int(new)
+        self.last_sync = now()
+        if added:
+            self.st.hub.publish("devices", {"devices": self.st.store.devices()})
+        return {"tags": len(tags), "added": added}
+
+    async def refresh(self, ids: list[str] | None = None) -> int:
+        if not self.connected:
+            raise NetworkError("Samsung-Konto ist nicht verbunden.")
+        async with self.alock:
+            if not self.last_sync or now() - self.last_sync > 6 * 3600:
+                await self.sync()
+            c = self.cfg()
+            total, pin_needed = 0, False
+            for d in self.st.store.network_devices("samsung"):
+                if not d["enabled"] or (ids and d["id"] not in ids):
+                    continue
+                start = None
+                if c.get("history"):
+                    newest = self.st.store.newest_ts(d["id"])
+                    start = max(now() - 7 * 86400, (newest - 3600) if newest else 0)
+                items, pn = await asyncio.to_thread(self.fetch, d["ext_id"], start)
+                pin_needed = pin_needed or pn
+                total += await ingest_network_reports(self.st, d["id"], items)
+            self.pin_required = pin_needed
+            self.last_refresh = now()
+            self.last_count = total
+            self.error = "Standorte sind verschlüsselt – bitte Samsung-Find-PIN eingeben." if pin_needed and total == 0 else None
+            if total:
+                self.st.hub.publish("devices", {"devices": self.st.store.devices()})
+            self.st.hub.publish("networks", {"samsung": self.status()})
+            return total
+
+    async def loop(self) -> None:
+        await asyncio.sleep(4)
+        while True:
+            c = self.cfg()
+            if c.get("enabled") and self.connected:
+                try:
+                    await self.refresh()
+                    self.failures = 0
+                except Exception as e:  # noqa: BLE001
+                    self.failures = min(self.failures + 1, 6)
+                    self.error = f"{e}"
+                    log.warning("Samsung-Abruf fehlgeschlagen: %s", e)
+                    self.st.hub.publish("networks", {"samsung": self.status()})
+            wait = max(30, int(c.get("interval", 120))) * (2 ** self.failures)
+            self.event.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.event.wait(), timeout=min(wait, 3600))
+
+
+# ── Google Find Hub (Server-Fallback über GoogleFindMyTools) ──────────────────
+
+GOOGLE_TOOLS_REPO = os.environ.get("FMU_GOOGLE_REPOSITORY", "leonboe1/GoogleFindMyTools")
+GOOGLE_TOOLS_COMMIT = os.environ.get("FMU_GOOGLE_COMMIT", "d46e9528578015b51d3b84dd91bf8f16e9ab850f")
+GOOGLE_TOOLS_URL = f"https://github.com/{GOOGLE_TOOLS_REPO}/archive/{GOOGLE_TOOLS_COMMIT}.zip"
+GOOGLE_FOREIGN_ENV = ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONPLATLIBDIR",
+                      "PYTHONUSERBASE", "__PYVENV_LAUNCHER__", "VIRTUAL_ENV", "FMU_BOOTSTRAPPED")
+
+
+class GoogleServer:
+    """
+    Google Find Hub auf dem Server – als Ergänzung bzw. Fallback zur Ortung
+    direkt in der App. Zugang: secrets.json (GoogleFindMyTools) oder die in der
+    App angemeldeten Schlüssel („An Server übergeben“). Abgerufen wird über
+    GoogleFindMyTools in einer eigenen Python-Umgebung (data/google/venv).
+    Die App liefert zusätzlich lokal entschlüsselte Standorte (POST
+    /api/google/app-reports); im Modus „auto“ ortet der Server nur, wenn die App
+    länger nichts geliefert hat.
+    """
+
+    def __init__(self, st: "State") -> None:
+        self.st = st
+        self.dir = DATA_DIR / "google"
+        self.secrets_path = self.dir / "secrets.json"
+        self.tools = self.dir / "tools"
+        self.venv = self.dir / "venv"
+        self.setup: dict = {"status": "idle", "message": ""}
+        self.error: str | None = None
+        self.last_refresh: float | None = None
+        self.last_sync: float | None = None
+        self.app_push: dict[str, float] = st.store.kv_get("google_app_push", {}) or {}
+        self.event = asyncio.Event()
+        self.alock = asyncio.Lock()
+        self.failures = 0
+        self._setup_task: asyncio.Task | None = None
+
+    def cfg(self) -> dict:
+        return self.st.store.settings()["networks"]["google"]
+
+    def secrets(self) -> dict:
+        return _private_json(self.secrets_path)
+
+    @property
+    def has_access(self) -> bool:
+        s = self.secrets()
+        return bool(s.get("username") and s.get("aas_token") and (s.get("owner_key") or s.get("shared_key")))
+
+    @property
+    def python(self) -> Path:
+        return self.venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    @property
+    def tools_ready(self) -> bool:
+        marker = _private_json(self.dir / "tools_meta.json")
+        return (self.tools / "main.py").exists() and self.python.exists() and marker.get("commit") == GOOGLE_TOOLS_COMMIT \
+            and marker.get("deps") is True
+
+    def status(self) -> dict:
+        c = self.cfg()
+        s = self.secrets()
+        return {"network": "google", "enabled": bool(c.get("enabled")), "server_mode": c.get("server_mode", "auto"),
+                "interval": int(c.get("interval", 900)), "account": mask_account(s.get("username")),
+                "secrets": bool(s.get("username") and s.get("aas_token")),
+                "keys": bool(s.get("owner_key") or s.get("shared_key")),
+                "tools_ready": self.tools_ready, "setup": self.setup, "error": self.error,
+                "last_refresh": self.last_refresh, "last_sync": self.last_sync,
+                "last_app_push": max(self.app_push.values()) if self.app_push else None,
+                "devices": len(self.st.store.network_devices("google"))}
+
+    # Zugang -------------------------------------------------------------------------
+    def store_secrets(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("Die secrets.json muss ein JSON-Objekt sein.")
+        cur = self.secrets()
+        username = str(data.get("username") or cur.get("username") or "")
+        if "@" not in username or not (data.get("aas_token") or cur.get("aas_token")):
+            raise ValueError("username und aas_token fehlen.")
+        for k in ("owner_key", "shared_key"):
+            v = data.get(k)
+            if v and not (isinstance(v, str) and len(v) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in v)):
+                raise ValueError(f"{k} ist kein gültiger 32-Byte-Schlüssel (64 Hex-Zeichen).")
+        new = dict(cur)
+        if cur.get("username") and cur["username"].lower() != username.lower():
+            new = {"fcm_credentials": cur.get("fcm_credentials")} if cur.get("fcm_credentials") else {}
+        for k in ("username", "aas_token", "owner_key", "shared_key", "owner_key_version", "fcm_credentials"):
+            if data.get(k):
+                new[k] = data[k]
+        new["username"] = username
+        if cur.get("username") and cur["username"] != username:
+            backup = self.dir / f"secrets-backup-{int(now())}.json"
+            _save_private_json(backup, cur)
+        _save_private_json(self.secrets_path, new)
+        self.error = None
+        self.failures = 0
+
+    def delete_secrets(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            self.secrets_path.unlink()
+        with contextlib.suppress(FileNotFoundError):
+            (self.tools / "Auth" / "secrets.json").unlink()
+
+    # Einrichtung (GoogleFindMyTools + eigene Python-Umgebung) ----------------------------
+    def _env(self, pythonpath: Path | None = None) -> dict:
+        env = os.environ.copy()
+        for k in GOOGLE_FOREIGN_ENV:
+            env.pop(k, None)
+        env["PYTHONUNBUFFERED"] = "1"
+        if pythonpath:
+            env["PYTHONPATH"] = str(pythonpath)
+        return env
+
+    def _install_sync(self) -> None:
+        import shutil
+        import stat
+        import tempfile
+        import urllib.request
+        import zipfile
+        self.dir.mkdir(parents=True, exist_ok=True)
+        meta = _private_json(self.dir / "tools_meta.json")
+        if not ((self.tools / "main.py").exists() and meta.get("commit") == GOOGLE_TOOLS_COMMIT):
+            self.setup = {"status": "running", "message": "GoogleFindMyTools wird geladen …"}
+            tmp = Path(tempfile.mkdtemp(prefix="gfmt-", dir=self.dir))
+            try:
+                zpath = tmp / "tools.zip"
+                req = urllib.request.Request(GOOGLE_TOOLS_URL, headers={"User-Agent": f"FindMyUltra/{VERSION}"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
+                    total = 0
+                    while chunk := r.read(1 << 20):
+                        total += len(chunk)
+                        if total > 30 << 20:
+                            raise ValueError("Download unerwartet groß")
+                        f.write(chunk)
+                out = tmp / "x"
+                with zipfile.ZipFile(zpath) as z:
+                    for info in z.infolist():
+                        parts = [p for p in info.filename.replace("\\", "/").split("/") if p not in ("", ".")]
+                        if info.filename.startswith("/") or ".." in parts or stat.S_ISLNK(info.external_attr >> 16):
+                            raise ValueError("Unsicherer Pfad im Archiv")
+                        target = out.joinpath(*parts) if parts else out
+                        if info.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with z.open(info) as src, open(target, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                roots = [p.parent for p in out.rglob("main.py") if (p.parent / "NovaApi").is_dir()]
+                if len(roots) != 1:
+                    raise ValueError("GoogleFindMyTools-Archiv nicht erkannt")
+                if self.tools.exists():
+                    shutil.rmtree(self.tools, ignore_errors=True)
+                shutil.move(str(roots[0]), str(self.tools))
+                meta = {"commit": GOOGLE_TOOLS_COMMIT, "repository": GOOGLE_TOOLS_REPO, "deps": False}
+                _save_private_json(self.dir / "tools_meta.json", meta)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        ok = False
+        if self.python.exists():
+            with contextlib.suppress(Exception):
+                ok = subprocess.run([str(self.python), "-I", "-c", "import encodings, json, ssl"],
+                                    capture_output=True, timeout=30, env=self._env()).returncode == 0
+        if not ok:
+            self.setup = {"status": "running", "message": "Python-Umgebung für Google wird erstellt …"}
+            if self.venv.exists():
+                shutil.rmtree(self.venv, ignore_errors=True)
+            r = subprocess.run([sys.executable, "-m", "venv", str(self.venv)], capture_output=True, text=True,
+                               timeout=600, env=self._env())
+            if r.returncode != 0:
+                raise RuntimeError("venv konnte nicht erstellt werden (python3-venv installieren): "
+                                   + (r.stderr or r.stdout)[-300:])
+        self.setup = {"status": "running", "message": "Abhängigkeiten werden installiert (einige Minuten) …"}
+        r = subprocess.run([str(self.python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+                            "--prefer-binary", "-r", str(self.tools / "requirements.txt"), "gpsoauth>=2.0.0,<3"],
+                           cwd=str(self.tools), capture_output=True, text=True, timeout=3600, env=self._env())
+        if r.returncode != 0:
+            raise RuntimeError("Installation der Abhängigkeiten fehlgeschlagen: " + (r.stderr or r.stdout)[-400:])
+        meta["deps"] = True
+        _save_private_json(self.dir / "tools_meta.json", meta)
+
+    def start_setup(self) -> None:
+        if self._setup_task and not self._setup_task.done():
+            return
+
+        async def run() -> None:
+            self.setup = {"status": "running", "message": "Einrichtung startet …", "started": now()}
+            try:
+                await asyncio.to_thread(self._install_sync)
+                self.setup = {"status": "success", "message": "Google-Server-Ortung ist einsatzbereit.", "finished": now()}
+                if self.has_access:
+                    with contextlib.suppress(Exception):
+                        await self.sync()
+            except Exception as e:  # noqa: BLE001
+                self.setup = {"status": "error", "message": f"{e}"[:400], "finished": now()}
+                log.warning("Google-Einrichtung fehlgeschlagen: %s", e)
+            self.st.hub.publish("networks", {"google": self.status()})
+
+        self._setup_task = asyncio.create_task(run())
+
+    # Bridge ---------------------------------------------------------------------------
+    def bridge(self, payload: dict, timeout: float) -> dict:
+        if not self.tools_ready:
+            raise NetworkError("Google-Server-Ortung ist noch nicht eingerichtet (Netzwerke → Google → Einrichten).")
+        canonical = self.secrets()
+        if not canonical:
+            raise NetworkError("Kein Google-Zugang auf dem Server – in der App „An Server übergeben“ oder secrets.json hochladen.")
+        target = self.tools / "Auth" / "secrets.json"
+        _save_private_json(target, canonical)
+        try:
+            proc = subprocess.run([str(self.python), "-c", GOOGLE_BRIDGE_SOURCE], cwd=str(self.tools),
+                                  env=self._env(self.tools), input=json.dumps(payload), capture_output=True,
+                                  text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise NetworkError("Google-Abruf hat das Zeitlimit überschritten.") from None
+        finally:
+            # FCM-Zugangsdaten werden von GoogleFindMyTools aktualisiert → zurückübernehmen
+            tool = _private_json(target)
+            if isinstance(tool.get("fcm_credentials"), dict) and tool["fcm_credentials"] != canonical.get("fcm_credentials"):
+                merged = dict(self.secrets() or canonical)
+                merged["fcm_credentials"] = tool["fcm_credentials"]
+                _save_private_json(self.secrets_path, merged)
+        for line in reversed((proc.stdout or "").splitlines()):
+            if line.startswith("__FUSION_JSON__"):
+                res = json.loads(line[len("__FUSION_JSON__"):])
+                if not res.get("ok"):
+                    detail = str(res.get("detail") or res.get("error") or "Google-Fehler")
+                    if "BadAuthentication" in detail or "NeedsBrowser" in detail:
+                        detail = "Google hat den Zugang abgelehnt – in der App neu anmelden und erneut übergeben."
+                    raise NetworkError(detail[:400])
+                return res
+        tail = ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-400:]
+        raise NetworkError("GoogleFindMyTools lieferte keine Antwort: " + tail.strip())
+
+    async def sync(self, restore: bool = False) -> dict:
+        async with self.alock:
+            res = await asyncio.to_thread(self.bridge, {"operation": "list"}, 120)
+        if restore:
+            set_network_ignored(self.st.store, "google", None, clear=True)
+        ignored = network_ignored(self.st.store, "google")
+        added = 0
+        for d in res.get("devices") or []:
+            if not d.get("id") or d["id"] in ignored:
+                continue
+            model = " ".join(x for x in (d.get("manufacturer"), d.get("model")) if x) or None
+            _, new = self.st.store.upsert_network_device("google", str(d["id"]), str(d.get("name") or "Google-Tracker")[:80],
+                                                         model, "tracker")
+            added += int(new)
+        self.last_sync = now()
+        if added:
+            self.st.hub.publish("devices", {"devices": self.st.store.devices()})
+        return {"trackers": len(res.get("devices") or []), "added": added}
+
+    async def locate(self, dev: dict) -> int:
+        async with self.alock:
+            res = await asyncio.to_thread(self.bridge, {"operation": "locate", "device_id": dev["ext_id"],
+                                                        "fcm_registration_timeout": 22, "fcm_ready_timeout": 24,
+                                                        "fcm_response_timeout": 48}, 200)
+        items = [{"ts": float(r["ts"]), "lat": round(float(r["lat"]), 7), "lon": round(float(r["lon"]), 7),
+                  "accuracy": int(float(r.get("acc") or 0)), "status": None, "battery": None}
+                 for r in res.get("reports") or [] if r.get("lat") is not None]
+        return await ingest_network_reports(self.st, dev["id"], items)
+
+    async def refresh(self, ids: list[str] | None = None, force: bool = True) -> int:
+        if not self.has_access or not self.tools_ready:
+            raise NetworkError("Google-Server-Ortung ist nicht eingerichtet.")
+        if not self.last_sync or now() - self.last_sync > 12 * 3600:
+            await self.sync()
+        c = self.cfg()
+        grace = float(c.get("app_grace_min", 30)) * 60
+        total = 0
+        errors = []
+        for d in self.st.store.network_devices("google"):
+            if not d["enabled"] or (ids and d["id"] not in ids):
+                continue
+            if not force and c.get("server_mode") == "auto" and now() - self.app_push.get(d["id"], 0) < grace:
+                continue  # App liefert gerade selbst – Server muss nicht orten
+            try:
+                total += await self.locate(d)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{d['name']}: {e}")
+        self.last_refresh = now()
+        self.error = "; ".join(errors)[:400] if errors else None
+        if total:
+            self.st.hub.publish("devices", {"devices": self.st.store.devices()})
+        self.st.hub.publish("networks", {"google": self.status()})
+        return total
+
+    async def app_reports(self, body: dict) -> dict:
+        """Von der App lokal entschlüsselte Google-Standorte übernehmen."""
+        ignored = network_ignored(self.st.store, "google")
+        total, mapping = 0, []
+        for d in body.get("devices") or []:
+            ext = str(d.get("id") or "").strip()
+            if not ext or ext in ignored:
+                continue
+            did, _ = self.st.store.upsert_network_device("google", ext, str(d.get("name") or "Google-Tracker")[:80],
+                                                         (str(d["model"])[:80] if d.get("model") else None), "tracker")
+            mapping.append({"ext_id": ext, "id": did})
+            items = []
+            for r in (d.get("reports") or [])[:5000]:
+                with contextlib.suppress(TypeError, ValueError, KeyError):
+                    items.append({"ts": round(float(r["ts"]), 3), "lat": round(float(r["lat"]), 7),
+                                  "lon": round(float(r["lon"]), 7),
+                                  "accuracy": int(float(r.get("accuracy") or 0)) if r.get("accuracy") is not None else None,
+                                  "battery": r.get("battery") if r.get("battery") in BATTERY.values() else None})
+            total += await ingest_network_reports(self.st, did, items)
+            self.app_push[did] = now()
+        self.st.store.kv_set("google_app_push", self.app_push)
+        if mapping:
+            self.st.hub.publish("devices", {"devices": self.st.store.devices()})
+        return {"ok": True, "new": total, "devices": mapping}
+
+    async def loop(self) -> None:
+        await asyncio.sleep(20)
+        while True:
+            c = self.cfg()
+            if c.get("enabled") and c.get("server_mode", "auto") != "off" and self.has_access and self.tools_ready:
+                try:
+                    await self.refresh(force=c.get("server_mode") == "always")
+                    self.failures = 0
+                except Exception as e:  # noqa: BLE001
+                    self.failures = min(self.failures + 1, 4)
+                    self.error = f"{e}"[:400]
+                    log.warning("Google-Server-Abruf fehlgeschlagen: %s", e)
+            wait = max(300, int(c.get("interval", 900))) * (2 ** self.failures)
+            self.event.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.event.wait(), timeout=min(wait, 4 * 3600))
+
+
+def networks_summary(st: "State") -> dict:
+    nets = st.store.settings()["networks"]
+    counts = {n: 0 for n in NETWORKS}
+    for row in st.store.db.execute("SELECT network, COUNT(*) FROM devices GROUP BY network").fetchall():
+        counts[row[0] or "apple"] = row[1]
+    out = {"apple": {"network": "apple", "enabled": bool(nets["apple"].get("enabled", True)),
+                     "connected": bool(st.apple and st.apple.logged_in), "devices": counts.get("apple", 0)}}
+    if st.samsung:
+        out["samsung"] = st.samsung.status()
+    if st.google:
+        out["google"] = st.google.status()
+    return out
+
+
+# Bridge-Skript für GoogleFindMyTools (läuft isoliert in data/google/venv).
+# Übernommen aus RJ TrackerApp (Backend), inkl. der dort beschriebenen Fixes.
+GOOGLE_BRIDGE_SOURCE = r'''
+import asyncio
+import contextlib
+import datetime
+import io
+import json
+import sys
+import threading
+import time
+import traceback
+import re
+
+MARKER="__FUSION_JSON__"
+
+# Python 3.14 no longer creates an implicit event loop for synchronous main
+# threads.  GoogleFindMyTools' FCM receiver still expects one in some releases,
+# so give the isolated bridge process its own loop before importing upstream
+# modules.  The process is short-lived and therefore owns the loop completely.
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+def install_google_oauth_guard():
+    """Replace upstream's unsafe auth_response['Auth'] lookup for this bridge.
+
+    GoogleFindMyTools currently indexes the response directly.  Google may
+    legitimately answer with Error/NeedsBrowser/BadAuthentication instead,
+    which otherwise becomes an unhelpful KeyError('Auth').  Keeping the patch
+    inside this short-lived subprocess leaves the downloaded upstream bundle
+    untouched while exposing a deterministic, sanitized error to the guardian.
+    """
+    import gpsoauth
+    import Auth.token_retrieval as token_retrieval
+    from Auth.aas_token_retrieval import get_aas_token
+    from Auth.fcm_receiver import FcmReceiver
+
+    def guarded_request_token(username, scope, play_services=False):
+        aas_token = get_aas_token()
+        android_id = FcmReceiver().get_android_id()
+        request_app = 'com.google.android.gms' if play_services else 'com.google.android.apps.adm'
+        last_response = None
+        for attempt in range(2):
+            response = gpsoauth.perform_oauth(
+                username, aas_token, android_id,
+                service='oauth2:https://www.googleapis.com/auth/' + scope,
+                app=request_app,
+                client_sig='38918a453d07199354f8b19af05ec6562ced5788',
+            )
+            last_response = response
+            if isinstance(response, dict) and response.get('Auth'):
+                return response['Auth']
+            # One small retry catches occasional auth endpoint hiccups without
+            # multiplying normal location traffic. Browser/account challenges
+            # cannot be fixed by repeating the same request.
+            error_name = str((response or {}).get('Error') or (response or {}).get('error') or 'MissingAuth') if isinstance(response, dict) else 'InvalidResponse'
+            if attempt == 0 and error_name.lower() not in {'needsbrowser', 'captcharequired', 'accountdisabled', 'accountdeleted', 'servicedisabled'}:
+                time.sleep(0.8)
+                continue
+            break
+
+        response = last_response if isinstance(last_response, dict) else {}
+        error_name = str(response.get('Error') or response.get('error') or 'MissingAuth')[:80]
+        error_detail = str(response.get('ErrorDetail') or response.get('error_detail') or '')[:240]
+        browser_required = bool(response.get('Url') or response.get('url'))
+        detail = f"google_oauth_error:{error_name}"
+        if error_detail:
+            detail += f"; detail={error_detail}"
+        if browser_required:
+            detail += "; browser_required=true"
+        raise RuntimeError(detail)
+
+    token_retrieval.request_token = guarded_request_token
+
+install_google_oauth_guard()
+
+def install_fcm_android_header_guard():
+    """Backport Google's Android API-key restriction headers at runtime.
+
+    The pinned upstream remains unmodified on disk. Google began rejecting
+    Firebase installation requests without the package/certificate identity;
+    newer upstream revisions add the same two public Android headers.
+    """
+    try:
+        import aiohttp
+        original=aiohttp.ClientSession._request
+        if getattr(original,"_uts_android_guard",False):
+            return
+        async def guarded(self,method,str_or_url,**kwargs):
+            url=str(str_or_url)
+            headers=dict(kwargs.get("headers") or {})
+            lower={str(key).lower() for key in headers}
+            if "googleapis.com" in url and "x-goog-api-key" in lower:
+                headers.setdefault("X-Android-Package","com.google.android.apps.adm")
+                headers.setdefault("X-Android-Cert","38918a453d07199354f8b19af05ec6562ced5788")
+                kwargs["headers"]=headers
+            return await original(self,method,str_or_url,**kwargs)
+        guarded._uts_android_guard=True
+        aiohttp.ClientSession._request=guarded
+    except Exception:
+        pass
+
+install_fcm_android_header_guard()
+
+def install_fcm_message_guard():
+    """Backport the reviewed transport fixes from GoogleFindMyTools PR #114.
+
+    Parse named Web Push parameters, accept unpadded base64url and isolate
+    malformed/foreign packets so one notification cannot kill the listener.
+    Only modifies the short-lived bridge; never rewrites installed upstream.
+    """
+    from Auth.firebase_messaging.fcmpushclient import FcmPushClient
+    original = FcmPushClient._decrypt_raw_data
+    def decode(credentials, crypto_key_str, salt_str, raw_data):
+        def padded(value):
+            return value + '=' * (-len(value) % 4)
+        return original(credentials, padded(crypto_key_str), padded(salt_str), raw_data)
+    FcmPushClient._decrypt_raw_data = staticmethod(decode)
+    def parameter(header, name):
+        for part in header.split(';'):
+            key, separator, value = part.strip().partition('=')
+            if separator and key == name:
+                return value.strip().strip('"')
+        return ''
+    def handle(self, msg):
+        try:
+            fields = {item.key: item.value for item in msg.app_data}
+            if fields.get('message_type') == 'deleted_messages' or not self.credentials:
+                return
+            if fields.get('subtype') != self.credentials.get('gcm', {}).get('app_id'):
+                return
+            key = parameter(fields.get('crypto-key', ''), 'dh')
+            salt = parameter(fields.get('encryption', ''), 'salt')
+            if not key or not salt:
+                return
+            decrypted = self._decrypt_raw_data(self.credentials, key, salt, msg.raw_data)
+            try:
+                value = json.loads(decrypted.decode('utf-8'))
+            except (ValueError, UnicodeError):
+                value = decrypted
+            self.callback(value, msg.persistent_id, self.callback_context)
+        except Exception:
+            # No packet contents, keys or tokens in diagnostics.
+            self._uts_invalid_messages = getattr(self, '_uts_invalid_messages', 0) + 1
+    FcmPushClient._handle_data_message = handle
+
+install_fcm_message_guard()
+
+def emit(value):
+    print(MARKER+json.dumps(value,ensure_ascii=False,separators=(",",":")))
+
+def parse_locations(text,metadata):
+    reports=[]
+    current={}
+    semantic=""
+    for raw in text.splitlines():
+        line=raw.strip()
+        if line.startswith("Semantic Location:"):
+            semantic=line.split(":",1)[1].strip()
+        elif line.startswith("Latitude:"):
+            current["lat"]=float(line.split(":",1)[1].strip())
+        elif line.startswith("Longitude:"):
+            current["lon"]=float(line.split(":",1)[1].strip())
+        elif line.startswith("Altitude:"):
+            current["alt"]=float(line.split(":",1)[1].strip())
+        elif line.startswith("Time:"):
+            value=line.split(":",1)[1].strip()
+            current["ts"]=int(datetime.datetime.strptime(value,"%Y-%m-%d %H:%M:%S").timestamp())
+        elif line.startswith("Status:"):
+            value=line.split(":",1)[1].strip()
+            try:
+                current["status"]=int(value)
+            except ValueError:
+                current["status"]=value
+        elif line.startswith("Is Own Report:"):
+            current["is_own_report"]=line.split(":",1)[1].strip().lower()=="true"
+            if "lat" in current and "lon" in current and "ts" in current:
+                match=None
+                for index,item in enumerate(metadata):
+                    if int(item.get("ts",0))==int(current["ts"]) and str(item.get("status"))==str(current.get("status")) and bool(item.get("is_own_report"))==bool(current["is_own_report"]):
+                        match=metadata.pop(index)
+                        break
+                if match is None and metadata:
+                    match=metadata.pop(0)
+                if match is not None:
+                    current["acc"]=float(match.get("accuracy",0) or 0)
+                if semantic:
+                    current["semantic"]=semantic
+                reports.append(current)
+            current={}
+            semantic=""
+    return reports
+
+def probe_battery_fields(message, prefix="", depth=0, out=None):
+    """Best-effort protobuf introspection; never invent a battery value."""
+    out=[] if out is None else out
+    if depth > 5 or len(out) >= 24 or message is None or not hasattr(message, "ListFields"):
+        return out
+    try:
+        fields=message.ListFields()
+    except Exception:
+        return out
+    for field,value in fields:
+        path=(prefix+"." if prefix else "")+field.name
+        if getattr(field,"message_type",None) is not None:
+            if getattr(field,"label",None)==getattr(field,"LABEL_REPEATED",3):
+                for index,item in enumerate(list(value)[:8]):
+                    probe_battery_fields(item,f"{path}[{index}]",depth+1,out)
+            else:
+                probe_battery_fields(value,path,depth+1,out)
+            continue
+        low=path.lower()
+        if "battery" not in low and "charge" not in low:
+            continue
+        item={"path":path}
+        try:
+            if getattr(field,"enum_type",None) is not None:
+                enum_value=field.enum_type.values_by_number.get(int(value))
+                item["value"]=int(value)
+                item["name"]=enum_value.name if enum_value else str(value)
+            elif isinstance(value,(int,float,bool,str)):
+                item["value"]=value
+            else:
+                item["value"]=str(value)[:120]
+        except Exception:
+            item["value"]=str(value)[:120]
+        out.append(item)
+        if len(out)>=24:
+            break
+    return out
+
+def list_devices():
+    from NovaApi.ListDevices.nbe_list_devices import request_device_list
+    from ProtoDecoders import DeviceUpdate_pb2
+    from ProtoDecoders.decoder import parse_device_list_protobuf
+    payload=request_device_list()
+    if not payload:
+        raise RuntimeError("empty_device_response")
+    result=[]
+    parsed=parse_device_list_protobuf(payload)
+    for device in parsed.deviceMetadata:
+        identifiers=device.identifierInformation.phoneInformation.canonicIds.canonicId if device.identifierInformation.type==DeviceUpdate_pb2.IDENTIFIER_ANDROID else device.identifierInformation.canonicIds.canonicId
+        registration=device.information.deviceRegistration
+        try:
+            device_type=DeviceUpdate_pb2.SpotDeviceType.Name(registration.deviceTypeInformation.deviceType)
+        except Exception:
+            device_type=str(registration.deviceTypeInformation.deviceType)
+        for identifier in identifiers:
+            result.append({
+                "id":identifier.id,
+                "name":device.userDefinedDeviceName or identifier.id,
+                "manufacturer":registration.manufacturer or "",
+                "model":registration.model or "",
+                "fast_pair_model_id":registration.fastPairModelId or "",
+                "device_type":device_type,
+                "image_url":device.imageInformation.imageUrl or "",
+                "custom_mcu":str(registration.fastPairModelId or "")=="003200",
+                "battery_probe":probe_battery_fields(device),
+            })
+    return result
+
+def start_fcm_listener(receiver, callback, registration_timeout=22, ready_timeout=24):
+    """Start upstream FCM without racing the Nova action against MCS login."""
+    try:
+        receiver.pc.config.connection_retry_count=2
+        receiver.pc.config.start_seconds_before_retry_connect=1.25
+        receiver.pc.config.abort_on_sequential_error_count=2
+    except Exception:
+        pass
+    holder={}
+    registered=threading.Event()
+    def register():
+        loop=asyncio.new_event_loop()
+        receiver._uts_registration_loop=loop
+        asyncio.set_event_loop(loop)
+        try:
+            holder["token"]=receiver.register_for_location_updates(callback)
+        except BaseException as exc:
+            holder["error"]=exc
+        finally:
+            registered.set()
+        # Older upstream revisions schedule pc.start() and immediately return
+        # from run_until_complete. Keep that exact loop alive so the MCS socket
+        # can actually reach RUNNING; newer revisions use their own loop and
+        # simply leave this compatibility loop idle.
+        if holder.get("error") is None:
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+            finally:
+                try:
+                    pending=asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending,return_exceptions=True))
+                    loop.close()
+                except Exception:
+                    pass
+    threading.Thread(target=register,daemon=True,name="uts-fcm-register").start()
+    if not registered.wait(max(5,float(registration_timeout))):
+        raise RuntimeError("fcm_registration_timeout")
+    if holder.get("error") is not None:
+        raise holder["error"]
+    deadline=time.monotonic()+max(5,float(ready_timeout))
+    while time.monotonic()<deadline:
+        try:
+            if receiver.pc.is_started():
+                return holder.get("token")
+        except Exception:
+            pass
+        time.sleep(0.1)
+    state_name=str(getattr(receiver.pc,"run_state","unknown"))[-80:]
+    raise RuntimeError("fcm_listener_not_ready:"+state_name)
+
+def stop_fcm_listener(receiver):
+    """Stop on the loop that owns FCM and close compatibility loop resources."""
+    own_loop=getattr(receiver,"_loop",None)
+    registration_loop=getattr(receiver,"_uts_registration_loop",None)
+    target=own_loop if own_loop is not None and own_loop.is_running() else registration_loop
+    if target is not None and target.is_running():
+        try:
+            future=asyncio.run_coroutine_threadsafe(receiver.pc.stop(),target)
+            future.result(timeout=5)
+        except Exception:
+            pass
+    else:
+        try:
+            receiver.stop_listening()
+        except Exception:
+            pass
+    try:
+        receiver._listening=False
+    except Exception:
+        pass
+    for loop in (own_loop,registration_loop):
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+
+def decrypt_update_reports(update, registration=None):
+    """Read protobuf values directly; one corrupt report cannot discard a batch."""
+    import hashlib
+    from NovaApi.ExecuteAction.LocateTracker import decrypt_locations as decryptor
+    from ProtoDecoders import DeviceUpdate_pb2, Common_pb2
+    locations = update.deviceMetadata.information.locationInformation.reports.recentLocationAndNetworkLocations
+    pairs = list(zip(locations.networkLocations, locations.networkLocationTimestamps))
+    if locations.HasField('recentLocation'):
+        pairs.append((locations.recentLocation, locations.recentLocationTimestamp))
+    pairs = [(loc, stamp) for loc, stamp in pairs if loc.status != Common_pb2.Status.SEMANTIC]
+    if not pairs:
+        return [], 0
+    registration = registration or update.deviceMetadata.information.deviceRegistration
+    identity_key = decryptor.retrieve_identity_key(registration)
+    is_mcu = decryptor.is_mcu_tracker(registration)
+    reports, failed = [], 0
+    for location, stamp in pairs:
+        try:
+            encrypted = location.geoLocation.encryptedReport
+            if not encrypted.publicKeyRandom:
+                raw = decryptor.decrypt_aes_gcm(hashlib.sha256(identity_key).digest(), encrypted.encryptedLocation)
+            else:
+                offset = 0 if is_mcu else location.geoLocation.deviceTimeOffset
+                raw = decryptor.decrypt(identity_key, encrypted.encryptedLocation, encrypted.publicKeyRandom, offset)
+            decoded = DeviceUpdate_pb2.Location()
+            decoded.ParseFromString(raw)
+            reports.append({'lat': decoded.latitude / 1e7, 'lon': decoded.longitude / 1e7,
+                            'alt': decoded.altitude, 'ts': int(stamp.seconds),
+                            'acc': float(location.geoLocation.accuracy), 'status': int(location.status),
+                            'is_own_report': bool(encrypted.isOwnReport)})
+        except Exception:
+            failed += 1
+    return reports, failed
+
+
+class GoogleResponseWindow:
+    """Thread-safe, bounded collection of all correlated FCM response packets."""
+    def __init__(self, request_uuid):
+        self.request_uuid = request_uuid
+        self.condition = threading.Condition()
+        self.packets = []
+        self.seen = set()
+        self.last_location_packet = None
+
+    def add(self, parsed):
+        if parsed.fcmMetadata.requestUuid != self.request_uuid:
+            return
+        key = parsed.SerializeToString()
+        with self.condition:
+            if key in self.seen or len(self.packets) >= 256:
+                return
+            self.seen.add(key)
+            self.packets.append(parsed)
+            locations = parsed.deviceMetadata.information.locationInformation.reports.recentLocationAndNetworkLocations
+            if locations.networkLocations or locations.HasField('recentLocation'):
+                self.last_location_packet = time.monotonic()
+            self.condition.notify_all()
+
+    def collect(self, timeout, settle=4):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                finish = min(deadline, self.last_location_packet + settle) if self.last_location_packet is not None else deadline
+                if now >= finish:
+                    return list(self.packets)
+                self.condition.wait(finish - now)
+
+
+def locate(payload):
+    from Auth.fcm_receiver import FcmReceiver
+    from NovaApi.ExecuteAction.LocateTracker.location_request import create_location_request
+    from NovaApi.nova_request import nova_request
+    from NovaApi.scopes import NOVA_ACTION_API_SCOPE
+    from NovaApi.util import generate_random_uuid
+    from ProtoDecoders.decoder import parse_device_update_protobuf
+    request_uuid = generate_random_uuid()
+    window = GoogleResponseWindow(request_uuid)
+    def handle_location_response(response):
+        try:
+            window.add(parse_device_update_protobuf(response))
+        except Exception:
+            pass  # A malformed packet must not terminate the stream.
+    receiver = FcmReceiver()
+    try:
+        fcm_token = start_fcm_listener(receiver, handle_location_response,
+                                      payload.get('fcm_registration_timeout', 22), payload.get('fcm_ready_timeout', 24))
+        hex_payload = create_location_request(payload['device_id'], fcm_token, request_uuid)
+        import importlib
+        nova_module = importlib.import_module('NovaApi.nova_request')
+        original_post = nova_module.requests.post
+        def bounded_post(*args, **kwargs):
+            kwargs.setdefault('timeout', (10, 20))
+            return original_post(*args, **kwargs)
+        nova_module.requests.post = bounded_post
+        try:
+            action_result = nova_request(NOVA_ACTION_API_SCOPE, hex_payload)
+        finally:
+            nova_module.requests.post = original_post
+        if action_result is None:
+            raise RuntimeError('nova_action_failed')
+        updates = window.collect(max(10, float(payload.get('fcm_response_timeout', 48))))
+        if not updates:
+            if not receiver.pc.is_started():
+                raise RuntimeError('fcm_listener_disconnected')
+            raise RuntimeError('fcm_response_timeout')
+        # A later packet can omit key metadata supplied by an earlier packet.
+        registration = next((item.deviceMetadata.information.deviceRegistration for item in reversed(updates)
+                             if item.deviceMetadata.information.deviceRegistration.encryptedUserSecrets.encryptedIdentityKey), None)
+        reports, errors, battery = [], 0, []
+        for update in updates:
+            battery.extend(probe_battery_fields(update))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    batch, failed = decrypt_update_reports(update, registration)
+                reports.extend(batch)
+                errors += failed
+            except (Exception, SystemExit):
+                errors += 1
+        if errors and not reports:
+            raise RuntimeError('google_decryption_failed:encrypted_reports_received')
+        unique = {(r['ts'], r['lat'], r['lon'], r['acc'], r['is_own_report']): r for r in reports}
+        return {'reports': sorted(unique.values(), key=lambda r: r['ts']), 'battery_probe': battery[:24],
+                'transport': 'fcm_ready', 'response_packets': len(updates), 'decryption_failures': errors}
+    finally:
+        stop_fcm_listener(receiver)
+
+def refresh_fcm():
+    from Auth.fcm_receiver import FcmReceiver
+    receiver=FcmReceiver()
+    start_fcm_listener(receiver,lambda *_args, **_kwargs: None,22,24)
+    android_id=receiver.get_android_id()
+    stop_fcm_listener(receiver)
+    return str(android_id or "")
+
+def recreate_fcm():
+    """Force a new GCM/FCM identity instead of accepting a stale check-in."""
+    from Auth.fcm_receiver import FcmReceiver
+    from Auth.firebase_messaging.fcmregister import FcmRegister
+    try:
+        from aiohttp import ClientTimeout
+    except Exception:
+        ClientTimeout=None
+    receiver=FcmReceiver()
+    async def force_registration():
+        config=getattr(receiver.pc,"fcm_config",None) or getattr(receiver.pc,"config",None)
+        if config is None:
+            raise RuntimeError("fcm_recreate_missing_config")
+        # Harmless on older dataclasses and consumed natively by newer ones.
+        config.android_package="com.google.android.apps.adm"
+        config.android_cert_sha1="38918a453d07199354f8b19af05ec6562ced5788"
+        callback=getattr(receiver,"_on_credentials_updated",None)
+        registration=FcmRegister(config,None,callback)
+        if ClientTimeout is not None:
+            registration.CLIENT_TIMEOUT=ClientTimeout(total=25)
+        try:
+            credentials=await asyncio.wait_for(registration.register(),timeout=70)
+        finally:
+            close=getattr(registration,"close",None)
+            if close:
+                result=close()
+                if asyncio.iscoroutine(result):
+                    await result
+        if not isinstance(credentials,dict) or not credentials.get("fcm") or not credentials.get("gcm"):
+            raise RuntimeError("fcm_recreate_invalid_credentials")
+        receiver.credentials=credentials
+        receiver.pc.credentials=credentials
+        receiver._on_credentials_updated(credentials)
+        return credentials
+    credentials=asyncio.run(force_registration())
+    return str(credentials.get("gcm",{}).get("android_id") or "")
+
+try:
+    request=json.loads(sys.stdin.read() or "{}")
+    operation=request.get("operation")
+    if operation=="list":
+        quiet=io.StringIO()
+        with contextlib.redirect_stdout(quiet),contextlib.redirect_stderr(quiet):
+            devices=list_devices()
+        emit({"ok":True,"devices":devices})
+    elif operation=="locate":
+        located=locate(request)
+        emit({"ok":True,**located})
+    elif operation=="refresh_fcm":
+        quiet=io.StringIO()
+        with contextlib.redirect_stdout(quiet),contextlib.redirect_stderr(quiet):
+            android_id=refresh_fcm()
+        emit({"ok":True,"android_id":android_id})
+    elif operation=="recreate_fcm":
+        quiet=io.StringIO()
+        with contextlib.redirect_stdout(quiet),contextlib.redirect_stderr(quiet):
+            android_id=recreate_fcm()
+        emit({"ok":True,"android_id":android_id,"recreated":True})
+    else:
+        emit({"ok":False,"error":"unsupported_operation","detail":str(operation or "")})
+except BaseException as exc:
+    detail=str(exc or "")[:800]
+    trace=" | ".join(traceback.format_exc().splitlines()[-5:])[:1200]
+    emit({"ok":False,"error":type(exc).__name__,"detail":detail,"trace":trace})
+'''
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Zustand & Scheduler
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -2381,6 +3939,8 @@ class State:
     notifier: Any = None
     alerts: Any = None
     online: Any = None
+    samsung: Any = None
+    google: Any = None
     poll_event: asyncio.Event = field(default_factory=asyncio.Event)
     poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     waiters: list = field(default_factory=list)
@@ -2410,6 +3970,7 @@ class State:
         s = self.store.settings()
         return {**self.status, "stats": self.store.stats(), "version": VERSION, "demo": self.args.demo,
                 "server_time": now(), "apple": self.apple.status() if self.apple else {"state": "demo"},
+                "networks": networks_summary(self),
                 "devices": len(self.registry.tracked) if self.registry else 0,
                 "poll_interval": s["poll_interval"], "retention_days": s["retention_days"]}
 
@@ -2472,7 +4033,7 @@ async def scheduler(st: State) -> None:
         t0 = now()
         plan: list[tuple[Tracked, str]] = []
         result = {"new": 0, "polled": 0, "error": None}
-        if st.apple.logged_in:
+        if st.apple.logged_in and s["networks"]["apple"].get("enabled", True):
             enabled = {d["id"]: d for d in st.store.devices() if d["enabled"]}
             for t in st.registry.tracked.values():
                 d = enabled.get(t.id)
@@ -2491,7 +4052,9 @@ async def scheduler(st: State) -> None:
                 result["new"] = await run_poll(st, plan)
                 result["polled"] = len(plan)
                 result["error"] = st.status.get("last_error")
-        elif st.waiters:
+        elif st.waiters and not s["networks"]["apple"].get("enabled", True):
+            result["error"] = None
+        elif st.waiters and st.registry.tracked:
             result["error"] = "Nicht bei Apple angemeldet"
         waiters, st.waiters = st.waiters, []
         for w in waiters:
@@ -2545,11 +4108,14 @@ async def demo_setup(st: State) -> None:
                                     "online": {"lat": pos[0], "lon": pos[1], "accuracy": 35,
                                                "ts": now() - random.randint(60, 1800),
                                                "position_type": "Wifi", "is_old": False, "inaccurate": False}})
-    seeds = [("demo-keys", "Schlüssel", "🔑", (52.5200, 13.4050)),
-             ("demo-bag", "Rucksack", "🎒", (52.5310, 13.3850)),
-             ("demo-bike", "Fahrrad", "🚲", (52.5080, 13.4300))]
-    for did, name, emoji, pos in seeds:
-        st.store.upsert_device(did, name, "AirTag", emoji, None, "airtag")
+    seeds = [("demo-keys", "Schlüssel", "🔑", (52.5200, 13.4050), "apple", "AirTag"),
+             ("demo-bag", "Rucksack", "🎒", (52.5310, 13.3850), "apple", "AirTag"),
+             ("demo-bike", "Fahrrad", "🚲", (52.5080, 13.4300), "apple", "AirTag"),
+             ("demo-wallet", "Geldbörse", "👛", (52.5000, 13.3600), "google", "Pebblebee Clip"),
+             ("demo-suitcase", "Koffer", "🧳", (52.5400, 13.4200), "samsung", "Galaxy SmartTag2")]
+    for did, name, emoji, pos, network, model in seeds:
+        st.store.upsert_device(did, name, model, emoji, None, "airtag" if network == "apple" else "tracker")
+        st.store.update_device(did, network=network, ext_id=None if network == "apple" else did)
         t = Tracked(did, {"pos": list(pos), "hdg": random.random() * 6.28})
         st.registry.tracked[did] = t
         if st.store.newest_ts(did):
@@ -2859,6 +4425,18 @@ def build_app(st: State) -> web.Application:
         s["day_sweep_minutes"] = max(2, int(s["day_sweep_minutes"]))
         s["full_sweep_minutes"] = max(10, int(s["full_sweep_minutes"]))
         s["retention_days"] = max(0, int(s["retention_days"]))
+        nets = s["networks"]
+        for n in NETWORKS:
+            nets[n]["enabled"] = bool(nets[n].get("enabled", True))
+        if nets["google"].get("server_mode") not in ("auto", "always", "off"):
+            nets["google"]["server_mode"] = "auto"
+        nets["google"]["interval"] = max(300, int(nets["google"].get("interval", 900)))
+        nets["google"]["app_grace_min"] = max(5, int(nets["google"].get("app_grace_min", 30)))
+        nets["samsung"]["interval"] = max(30, int(nets["samsung"].get("interval", 120)))
+        nets["samsung"]["history"] = bool(nets["samsung"].get("history"))
+        for obj in (st.samsung, st.google):
+            if obj:
+                obj.event.set()
         od = s["online_devices"]
         od["enabled"] = bool(od.get("enabled"))
         od["interval"] = max(30, int(od.get("interval", 120)))
@@ -3013,6 +4591,10 @@ def build_app(st: State) -> web.Application:
 
     async def device_delete(req: web.Request) -> web.Response:
         did = req.match_info["id"]
+        row = st.store.device_row(did)
+        if row and row.get("network") in ("google", "samsung") and row.get("ext_id"):
+            # sonst legt die nächste Synchronisierung den Tracker sofort wieder an
+            set_network_ignored(st.store, row["network"], row["ext_id"], True)
         st.registry.remove(did)
         st.store.delete_device(did, keep_reports=req.query.get("keep_reports") == "1")
         st.hub.publish("devices", {"devices": st.store.devices()})
@@ -3354,14 +4936,168 @@ def build_app(st: State) -> web.Application:
     async def refresh(req: web.Request) -> web.Response:
         b = await req.json() if req.can_read_body else {}
         ids = b.get("device_ids") or ([b["device_id"]] if b.get("device_id") else None)
+        nets = st.store.settings()["networks"]
+        by_net: dict[str, list[str]] = {}
+        for d in st.store.devices():
+            if ids is None or d["id"] in ids:
+                by_net.setdefault(d.get("network") or "apple", []).append(d["id"])
+        extra_new, errors = 0, []
+        # Samsung: schnell, direkt mit abrufen
+        if (st.samsung and st.samsung.connected and nets["samsung"].get("enabled")
+                and by_net.get("samsung") and not st.args.demo):
+            try:
+                extra_new += await asyncio.wait_for(st.samsung.refresh(ids and by_net["samsung"]), timeout=60)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"Samsung: {e}")
+        # Google: Server-Ortung nur auf ausdrücklichen Wunsch für einzelne Tracker (dauert bis ~2 min)
+        if (ids and by_net.get("google") and st.google and st.google.has_access and st.google.tools_ready
+                and nets["google"].get("server_mode") != "off" and not st.args.demo):
+            try:
+                extra_new += await asyncio.wait_for(st.google.refresh(by_net["google"]), timeout=180)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"Google: {e}")
+        if ids is not None and not by_net.get("apple") and not st.args.demo:
+            return web.json_response({"ok": not errors, "new": extra_new, "polled": len(ids),
+                                      "error": "; ".join(errors) or None})
         fut = st.wake(ids, full=bool(b.get("full", True)))
         if not b.get("wait", True):
             return web.json_response({"ok": True, "queued": True})
         try:
             res = await asyncio.wait_for(asyncio.shield(fut), timeout=float(b.get("timeout", 90)))
         except asyncio.TimeoutError:
-            return web.json_response({"ok": True, "queued": True, "timeout": True})
+            return web.json_response({"ok": True, "queued": True, "timeout": True, "new": extra_new})
+        res = dict(res)
+        res["new"] = (res.get("new") or 0) + extra_new
+        if errors:
+            res["error"] = "; ".join(filter(None, [res.get("error"), *errors]))
         return web.json_response({"ok": res.get("error") is None, **res})
+
+    # --- Netzwerke: Google & Samsung --------------------------------------------------
+    def need_net(obj: Any, name: str) -> Any:
+        if st.args.demo or obj is None:
+            raise ValueError(f"{name} ist im Demo-Modus nicht verfügbar")
+        return obj
+
+    async def networks(_: web.Request) -> web.Response:
+        return web.json_response(networks_summary(st))
+
+    async def samsung_login(_: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        try:
+            url = await asyncio.to_thread(sm.login_url)
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Samsung-Login konnte nicht vorbereitet werden: {e}")
+        return web.json_response({"ok": True, "login_url": url, "redirect_scheme": "ms-app", "expires_in": 1800})
+
+    async def samsung_complete(req: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        b = await req.json()
+        try:
+            await asyncio.to_thread(sm.complete_login, str(b.get("redirect_url") or ""))
+        except Exception as e:  # noqa: BLE001
+            return jerr(400, f"Samsung-Anmeldung fehlgeschlagen: {e}")
+        info: dict = {}
+        try:
+            info = await sm.sync()
+        except Exception as e:  # noqa: BLE001
+            sm.error = f"Konto verbunden, Geräteliste noch nicht geladen: {e}"
+        if b.get("pin"):
+            sm.set_pin(b["pin"])
+        sm.event.set()
+        st.hub.publish("networks", {"samsung": sm.status()})
+        return web.json_response({"ok": True, **info, "status": sm.status()})
+
+    async def samsung_logout(_: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        sm.logout()
+        st.hub.publish("networks", {"samsung": sm.status()})
+        return web.json_response({"ok": True, "status": sm.status()})
+
+    async def samsung_pin(req: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        if req.method == "DELETE":
+            sm.set_pin(None)
+        else:
+            pin = str((await req.json()).get("pin") or "").strip()
+            if not pin or len(pin) > 128:
+                return jerr(400, "Bitte eine gültige Samsung-Find-PIN eingeben.")
+            sm.set_pin(pin)
+            sm.event.set()
+        return web.json_response({"ok": True, "status": sm.status()})
+
+    async def samsung_sync(req: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        if not sm.connected:
+            return jerr(400, "Bitte zuerst das Samsung-Konto verbinden.")
+        b = await req.json() if req.can_read_body else {}
+        try:
+            info = await sm.sync(restore=bool(b.get("restore")))
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Samsung-Geräteliste: {e}")
+        return web.json_response({"ok": True, **info, "status": sm.status()})
+
+    async def samsung_refresh(_: web.Request) -> web.Response:
+        sm = need_net(st.samsung, "Samsung")
+        try:
+            n = await sm.refresh()
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Samsung-Abruf fehlgeschlagen: {e}")
+        return web.json_response({"ok": True, "new": n, "status": sm.status()})
+
+    async def google_secrets(req: web.Request) -> web.Response:
+        g = need_net(st.google, "Google")
+        if req.method == "DELETE":
+            g.delete_secrets()
+            return web.json_response({"ok": True, "status": g.status()})
+        if req.content_type.startswith("multipart/"):
+            data = {}
+            async for part in await req.multipart():
+                raw = await part.read(decode=True)
+                data = json.loads(raw.decode("utf-8-sig"))
+                break
+        else:
+            data = await req.json()
+        try:
+            g.store_secrets(data)
+        except Exception as e:  # noqa: BLE001
+            return jerr(400, f"{e}")
+        if not g.tools_ready:
+            g.start_setup()
+        else:
+            asyncio.create_task(g.sync())
+        st.hub.publish("networks", {"google": g.status()})
+        return web.json_response({"ok": True, "status": g.status()})
+
+    async def google_setup(_: web.Request) -> web.Response:
+        g = need_net(st.google, "Google")
+        g.start_setup()
+        return web.json_response({"ok": True, "status": g.status()})
+
+    async def google_sync(req: web.Request) -> web.Response:
+        g = need_net(st.google, "Google")
+        b = await req.json() if req.can_read_body else {}
+        try:
+            info = await g.sync(restore=bool(b.get("restore")))
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Google-Geräteliste: {e}")
+        return web.json_response({"ok": True, **info, "status": g.status()})
+
+    async def google_refresh(req: web.Request) -> web.Response:
+        g = need_net(st.google, "Google")
+        b = await req.json() if req.can_read_body else {}
+        ids = b.get("device_ids") or ([b["device_id"]] if b.get("device_id") else None)
+        try:
+            n = await g.refresh(ids)
+        except Exception as e:  # noqa: BLE001
+            return jerr(502, f"Google-Abruf fehlgeschlagen: {e}")
+        return web.json_response({"ok": True, "new": n, "status": g.status()})
+
+    async def google_app_reports(req: web.Request) -> web.Response:
+        if st.google is None:
+            return jerr(400, "Google ist nicht verfügbar")
+        if not st.store.settings()["networks"]["google"].get("enabled", True):
+            return web.json_response({"ok": True, "new": 0, "devices": [], "disabled": True})
+        return web.json_response(await st.google.app_reports(await req.json()))
 
     async def events(req: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
@@ -3394,10 +5130,12 @@ def build_app(st: State) -> web.Application:
         buf = io.StringIO()
         w = csv.writer(buf, delimiter=";")
         w.writerow(["geraet", "zeit_utc", "lat", "lon", "genauigkeit_m", "batterie", "empfangen_utc",
-                    "batch_groesse", "nachgereicht"])
+                    "batch_groesse", "nachgereicht", "netz"])
+        nets = {d["id"]: d.get("network") or "apple" for d in st.store.devices()}
         for x in rows:
             w.writerow([names.get(x["device_id"], x["device_id"]), iso(x["ts"]), x["lat"], x["lon"],
-                        x["accuracy"], x["battery"], iso(x["received_at"]), x["batch_size"], x["late"]])
+                        x["accuracy"], x["battery"], iso(x["received_at"]), x["batch_size"], x["late"],
+                        nets.get(x["device_id"], "apple")])
         return web.Response(text=buf.getvalue(), content_type="text/csv", charset="utf-8",
                             headers={"Content-Disposition": 'attachment; filename="findmy-ultra.csv"'})
 
@@ -3489,6 +5227,20 @@ def build_app(st: State) -> web.Application:
     r.add_post("/api/import", import_keys)
     r.add_post("/api/refresh", refresh)
     r.add_get("/api/events", events)
+    r.add_get("/api/networks", networks)
+    r.add_post("/api/samsung/login", samsung_login)
+    r.add_post("/api/samsung/complete", samsung_complete)
+    r.add_post("/api/samsung/logout", samsung_logout)
+    r.add_post("/api/samsung/pin", samsung_pin)
+    r.add_delete("/api/samsung/pin", samsung_pin)
+    r.add_post("/api/samsung/sync", samsung_sync)
+    r.add_post("/api/samsung/refresh", samsung_refresh)
+    r.add_post("/api/google/secrets", google_secrets)
+    r.add_delete("/api/google/secrets", google_secrets)
+    r.add_post("/api/google/setup", google_setup)
+    r.add_post("/api/google/sync", google_sync)
+    r.add_post("/api/google/refresh", google_refresh)
+    r.add_post("/api/google/app-reports", google_app_reports)
     r.add_get("/export.csv", export_csv)
     r.add_get("/export.json", export_json)
     r.add_get("/export.gpx", export_gpx)
@@ -3771,6 +5523,8 @@ async def amain(args: argparse.Namespace) -> None:
     st.notifier = Notifier(st)
     st.online = OnlineDevices(st)
     st.alerts = Alerts(st)
+    st.samsung = Samsung(st)
+    st.google = GoogleServer(st)
 
     tasks: list[asyncio.Task] = []
     if args.demo:
@@ -3791,6 +5545,8 @@ async def amain(args: argparse.Namespace) -> None:
         await st.apple.restore()
         tasks.append(asyncio.create_task(scheduler(st)))
         tasks.append(asyncio.create_task(st.online.loop()))
+        tasks.append(asyncio.create_task(st.samsung.loop()))
+        tasks.append(asyncio.create_task(st.google.loop()))
 
     app = build_app(st)
     runner = web.AppRunner(app, access_log=None)
@@ -3824,6 +5580,8 @@ async def amain(args: argparse.Namespace) -> None:
         a = st.apple.status()
         print(f"\n  Apple: {'✅ ' + str(a.get('account_name') or 'angemeldet') if a['state'] == 'logged_in' else '❌ nicht angemeldet – in der App einrichten'}")
         print(f"  Geräte mit Schlüsseln: {len(st.registry.tracked)}")
+        print(f"  Samsung: {'✅ ' + (st.samsung.status()['account'] or 'verbunden') if st.samsung.connected else '–'}"
+              f"   ·   Google (Server): {'✅ ' + st.google.status()['account'] if st.google.has_access else '–'}")
     print("═" * 64 + "\n")
 
     stop = asyncio.Event()

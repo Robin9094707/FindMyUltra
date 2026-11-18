@@ -1,0 +1,37 @@
+# Spot integration
+
+Source: https://github.com/leonboe1/Spot
+Commit: 55f87f62302fae24150188124e8e07d5285568d8
+Copyright © 2024–2026 Leon Böttger. GPL-3.0-only.
+
+Vendored as the SpotIntegration framework in RJ Tracker 5.0. Original application entry point and restricted icon artwork are excluded. RJ Tracker retains its own icon.
+
+Integration changes: public host/snapshot bridge; separate Keychain/preferences and account-specific history stores; non-destructive Core Data migration; authenticated async login completion; request validation; local secrets import; lifecycle forwarding. All original tracker management, Bluetooth, crypto, location, sharing and ESP32 creation sources are included.
+
+The complete combined application source is distributed under GPL-3.0-only. Third-party notices remain in Licenses and Configuration.swift. Backend dependencies retain their respective licenses.
+
+The dependency versions are pinned to the upstream Package.resolved, including Digest 1.12.0, BigInt 1.21.0 and ASN1 2.7.0. Newer Digest enum cases are incompatible with SwiftECC 5.4.0.
+
+## 5.1 engine extraction
+
+Removed the whole Spot/LUI presentation layer. The host owns every view and authentication WebKit presentation. Kept the same Keychain service, preferences suite and history paths for migration. Replaced blocking registration/push transport, retained multi-message report windows and added a protected raw-report archive. The original protocol attribution and GPL notices remain.
+
+## Google reliability review (2026-10-29)
+
+Compared the vendored engine with:
+
+- [Spot NovaApiManager at 55f87f6](https://github.com/leonboe1/Spot/blob/55f87f62302fae24150188124e8e07d5285568d8/Spot/DataProcessing/NovaApi/NovaApiManager.swift): restored the Adaptive all-areas fallback that the integration had dropped, while retaining all packets in each response window and bounding fallback to one request.
+- [GoogleFindMyTools](https://github.com/leonboe1/GoogleFindMyTools), the related Find Hub protocol implementation, including its Firebase/MCS transport layout.
+
+Local integration fixes retain pending Nova actions across MCS reconnects, prevent expired actions from being sent on a later login, schedule initial requests directly from the loaded catalog, and preserve validated per-device keys when partial or older archived metadata arrives. No credential service, preference suite, archive path, or Core Data schema changed. Malformed truncated AES-GCM packets now fail without an out-of-bounds crash.
+
+## 7.0 transport review (2026-11-06)
+
+GoogleFindMyTools [PR #114](https://github.com/leonboe1/GoogleFindMyTools/pull/114), head `c378f8cffe5892c63de1361767eb1647dc584c45`, identifies semicolon-delimited Web Push header parameters and missing base64url padding as listener failure causes. RJ Tracker parses named dh/salt parameters in Swift and backports packet isolation/padding to its isolated Python bridge. The upstream dependency pin stays unchanged; no credential format migration or key deletion. See [the upgrade investigation](../../docs/UPGRADE-7.0.0.md).
+
+## FindMy Ultra 1.7 (2026-11-18)
+
+Übernommen aus RJ TrackerApp (`Vendor/Spot`, Stand 8.1.0) als Framework `SpotIntegration`.
+Änderungen: eigener Preferences-Suite-Name `de.findmyultra.spot`; neue öffentliche Funktion
+`GoogleTrackerStore.exportSecrets()` zum Übergeben des Zugangs an den eigenen FindMy-Ultra-Server.
+Lizenz unverändert GPL-3.0-only (siehe `LICENSE`, `Licenses/`).
