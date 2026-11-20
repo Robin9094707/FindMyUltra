@@ -1,4 +1,23 @@
-findmy>=0.10.2
+# FindMy Ultra – Server-Abhängigkeiten (installiert der Server beim Start selbst in ./.venv).
+# Von Hand in zwei Schritten (Schritt 2 ohne Abhängigkeiten, sonst verlangt Anisette git):
+#   pip install -r requirements.txt
+#   pip install --no-deps --force-reinstall \
+#     "Anisette @ https://github.com/sacca97/Anisette.py/archive/627c9c663062bd872182b653113759c9d66b7e13.zip" \
+#     "FindMy @ https://github.com/sacca97/FindMy.py/archive/f2d24c86c3357f93cc19dd605fa9dc34d6d1b1c6.zip"
+# Hintergrund: Apple verlangt seit Okt. 2026 eine macOS-Identität (FindMy.py #278/#279).
+
+macOS-ADI-emulator @ https://github.com/sacca97/os-findmy-e/archive/374d83854f657a7fdca45f813387d99d491db0e2.zip#subdirectory=macOS-ADI-emulator
 aiohttp>=3.9.5,<4
+httpx>=0.28.1
+pyelftools>=0.33
+unicorn>=2.1.4,<3
+websockets>=13
+typing-extensions>=4.12.2,<5
+srp>=1.0.21,<2
+cryptography>=42
+beautifulsoup4>=4.12.3,<5
+bleak>=3.0.2,<3.1.0
+certifi
+
 # optional, für die Online-Ortung der Apple-Geräte (wird bei Bedarf automatisch installiert)
 pyicloud>=2.0

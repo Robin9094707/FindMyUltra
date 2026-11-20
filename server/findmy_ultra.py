@@ -54,19 +54,54 @@ import subprocess
 import sys
 from pathlib import Path
 
-REQUIREMENTS = ["findmy>=0.10.2", "aiohttp>=3.9.5,<4"]
+# Seit Mitte Oktober 2026 verlangt Apple bei der Anmeldung eine macOS-Identität
+# (FindMy.py Issue #278). Bis FindMy.py das offiziell veröffentlicht, nutzen wir
+# die geprüften Kompatibilitäts-Stände aus PR #279 (FindMy.py) bzw. #6 (Anisette.py).
+# Installiert wird ohne git direkt aus den GitHub-Archiven (feste Commits).
+_GH = "https://github.com"
+REQUIREMENTS_DEPS = [
+    f"macOS-ADI-emulator @ {_GH}/sacca97/os-findmy-e/archive/374d83854f657a7fdca45f813387d99d491db0e2.zip"
+    "#subdirectory=macOS-ADI-emulator",
+    "aiohttp>=3.9.5,<4", "httpx>=0.28.1", "pyelftools>=0.33", "unicorn>=2.1.4,<3", "websockets>=13",
+    "typing-extensions>=4.12.2,<5", "srp>=1.0.21,<2", "cryptography>=42", "beautifulsoup4>=4.12.3,<5",
+    "bleak>=3.0.2,<3.1.0", "certifi",
+]
+REQUIREMENTS_PINNED = [  # ohne Abhängigkeiten (die stehen oben), sonst zieht Anisette git-Quellen nach
+    f"Anisette @ {_GH}/sacca97/Anisette.py/archive/627c9c663062bd872182b653113759c9d66b7e13.zip",
+    f"FindMy @ {_GH}/sacca97/FindMy.py/archive/f2d24c86c3357f93cc19dd605fa9dc34d6d1b1c6.zip",
+]
+REQUIREMENTS = REQUIREMENTS_DEPS + REQUIREMENTS_PINNED
 _HERE = Path(__file__).resolve().parent
 
 
-def _bootstrap() -> None:
+def _deps_state() -> str:
+    """ok = alles da · old = Pakete da, aber ohne Apple-Kompatibilität · missing = fehlen."""
     try:
         import aiohttp  # noqa: F401
         import findmy  # noqa: F401
-        return
     except ImportError:
+        return "missing"
+    try:
+        import anisette
+        from findmy.reports.anisette import BaseAnisetteProvider
+        if hasattr(anisette, "AsyncAnisetteProvider") and hasattr(BaseAnisetteProvider, "get_client_info"):
+            return "ok"
+    except Exception:  # noqa: BLE001
         pass
+    return "old"
+
+
+def _bootstrap() -> None:
+    state = _deps_state()
+    if state == "ok":
+        return
     if os.environ.get("FMU_BOOTSTRAPPED") or "--no-bootstrap" in sys.argv:
-        print("❌ Abhängigkeiten fehlen: pip install " + " ".join(REQUIREMENTS))
+        if state == "old":
+            print("⚠️  FindMy.py ohne Apple-Kompatibilität (Okt. 2026) – Apple-Anmeldung wird scheitern.")
+            print("   Installieren: pip install " + " ".join(f'"{r}"' for r in REQUIREMENTS_DEPS))
+            print("                 pip install --no-deps --force-reinstall " + " ".join(f'"{r}"' for r in REQUIREMENTS_PINNED))
+            return
+        print("❌ Abhängigkeiten fehlen – siehe README (Abschnitt Server).")
         sys.exit(1)
     if sys.version_info < (3, 10):
         print("❌ Python 3.10 oder neuer nötig.")
@@ -76,9 +111,11 @@ def _bootstrap() -> None:
     if not py.exists():
         print(f"→ Erstelle virtuelle Umgebung in {venv} …")
         subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
-    print("→ Installiere Abhängigkeiten (einmalig) …")
+    print("→ Installiere bzw. aktualisiere Abhängigkeiten (einmalig, ein paar Minuten) …")
     subprocess.check_call([str(py), "-m", "pip", "install", "-q", "--upgrade", "pip"])
-    subprocess.check_call([str(py), "-m", "pip", "install", "-q", "--prefer-binary", *REQUIREMENTS])
+    subprocess.check_call([str(py), "-m", "pip", "install", "-q", "--prefer-binary", *REQUIREMENTS_DEPS])
+    subprocess.check_call([str(py), "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall",
+                           *REQUIREMENTS_PINNED])
     env = dict(os.environ, FMU_BOOTSTRAPPED="1")
     os.execve(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
@@ -111,6 +148,7 @@ import sqlite3
 import ssl
 import struct
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -118,7 +156,7 @@ from urllib.parse import quote, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 
 APP_NAME = "FindMy Ultra"
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 DATA_DIR = Path(os.environ.get("FMU_HOME", _HERE / "data"))
 log = logging.getLogger("findmy-ultra")
 
@@ -1073,6 +1111,2065 @@ class Hub:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Apple-Anmeldung mit macOS-Identität (seit Oktober 2026 nötig)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Apple lehnt seit ca. 12.10.2026 Anmeldungen mit der bisherigen Android-Anisette
+# ab („Email verification failed …“, kein searchPartyToken). Lösung wie in
+# FindMy.py #278/#279: Apples echte CoreADI-Bibliothek (macOS, aus dem offiziellen
+# iTunes-12.8.3-Installer) läuft in einem x86-Emulator (Unicorn).
+#   * Die Bibliothek lädt der Server einmalig direkt von Apple (~290 MB) und prüft
+#     beide SHA-256-Summen. Ausgepackt wird in reinem Python (kein 7-Zip nötig).
+#   * Emulator-Code: sacca97/os-findmy-e@374d838, tools/machoadi (MIT, © 2026 sacca),
+#     mit den Anpassungen aus RJ TrackerApp (Paket-Importe, Datei schließen).
+#   * Statt Download: Umgebungsvariable FMU_MACOS_ADI bzw. MACOS_ADI_BINARY auf eine
+#     vorhandene CoreADI.x86_64 (z. B. aus RJ TrackerApp runtime/) zeigen lassen.
+
+APPLE_DMG_URL = ("https://secure-appldnld.apple.com/itunes12/041-56365-20210413-79A5AC6D-6B0A-46EC-B399-"
+                 "5A381183E3BE/iTunes12.8.3.dmg")
+APPLE_DMG_SHA256 = "dd08b9967db3e5847955fa168ce880303abf5f36de12abb2061e7ef1a25be214"
+APPLE_ADI_SHA256 = "2eafc3c79c7f41a8afbfbeaaf23ee5dab5ad5bda55ec8e54dbc0ddf1d20ce630"
+APPLE_ADI_FRAMEWORK = "System/Library/PrivateFrameworks/CoreADI.framework/Versions/A/CoreADI"
+
+
+def _udif_to_raw(dmg: Path, out: Any) -> None:
+    """Apple-Disk-Image (UDIF) in ein Rohabbild schreiben (zlib/bzip2/unkomprimiert)."""
+    import bz2
+    with open(dmg, "rb") as f:
+        f.seek(-512, 2)
+        koly = f.read(512)
+        if koly[:4] != b"koly":
+            raise ValueError("Kein Apple-Disk-Image")
+        xml_off, xml_len = struct.unpack_from(">QQ", koly, 0xD8)
+        f.seek(xml_off)
+        pl = plistlib.loads(f.read(xml_len))
+        for blk in pl["resource-fork"]["blkx"]:
+            mish = blk["Data"]
+            if mish[:4] != b"mish":
+                raise ValueError("Unbekannte Disk-Image-Tabelle")
+            sector0, = struct.unpack_from(">Q", mish, 8)
+            data_off, = struct.unpack_from(">Q", mish, 24)
+            n, = struct.unpack_from(">I", mish, 200)
+            for i in range(n):
+                t, _, sn, _, co, cl = struct.unpack_from(">IIQQQQ", mish, 204 + 40 * i)
+                if t in (0, 2, 0x7FFFFFFE, 0xFFFFFFFF):
+                    continue
+                f.seek(data_off + co)
+                buf = f.read(cl)
+                if t == 1:
+                    data = buf
+                elif t == 0x80000005:
+                    data = zlib.decompress(buf)
+                elif t == 0x80000006:
+                    data = bz2.decompress(buf)
+                else:
+                    raise ValueError(f"Disk-Image-Kompression {t:#x} nicht unterstützt")
+                out.seek((sector0 + sn) * 512)
+                out.write(data)
+
+
+def _adi_from_image(blob: Any) -> bytes:
+    """CoreADI (x86_64) aus dem Rohabbild holen: xar-Paket → CoreADI.pkg/Payload → cpio → Mach-O."""
+    import gzip
+    import xml.etree.ElementTree as ET
+    pos = 0
+    payload = None
+    while payload is None:
+        pos = blob.find(b"xar!", pos)
+        if pos < 0:
+            raise ValueError("CoreADI.pkg im Apple-Installer nicht gefunden")
+        try:
+            hsize, _, tcl, _, _ = struct.unpack_from(">HHQQI", blob, pos + 4)
+            if hsize < 28 or tcl > 50_000_000:
+                raise ValueError
+            toc = zlib.decompress(blob[pos + hsize:pos + hsize + tcl]).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pos += 4
+            continue
+        if "CoreADI.pkg" in toc:
+            heap = pos + hsize + tcl
+            for d in ET.fromstring(toc).iter("file"):
+                if (d.findtext("name") or "") != "CoreADI.pkg":
+                    continue
+                for f in d.findall("file"):
+                    if f.findtext("name") != "Payload":
+                        continue
+                    off, ln = int(f.findtext("data/offset")), int(f.findtext("data/length"))
+                    sha1 = (f.findtext("data/archived-checksum") or "").strip().lower()
+                    cand = blob[heap + off:heap + off + ln]
+                    if hashlib.sha1(cand).hexdigest() == sha1:
+                        payload = cand
+                    else:  # Paket liegt im HFS+-Abbild nicht am Stück → über Prüfsumme suchen
+                        p = 0
+                        while payload is None and (p := blob.find(b"\x1f\x8b\x08", p)) >= 0:
+                            if hashlib.sha1(blob[p:p + ln]).hexdigest() == sha1:
+                                payload = blob[p:p + ln]
+                            p += 1
+        pos += 4
+    data = gzip.decompress(payload)
+    pos, framework = 0, None
+    while pos + 76 <= len(data):
+        if data[pos:pos + 6] != b"070707":
+            raise ValueError("Unerwartetes cpio-Format")
+        mode = int(data[pos + 18:pos + 24], 8)
+        name_size = int(data[pos + 59:pos + 65], 8)
+        size = int(data[pos + 65:pos + 76], 8)
+        start, end = pos + 76, pos + 76 + name_size
+        name = data[start:end - 1].decode()
+        if name.removeprefix("./") == APPLE_ADI_FRAMEWORK and mode & 0o170000 == 0o100000:
+            framework = data[end:end + size]
+            break
+        if name == "TRAILER!!!":
+            break
+        pos = end + size
+    if framework is None or framework[:4] != b"\xca\xfe\xba\xbe":
+        raise ValueError("CoreADI.framework nicht gefunden")
+    count, = struct.unpack_from(">I", framework, 4)
+    for i in range(count):
+        cpu, _, off, size, _ = struct.unpack_from(">IIIII", framework, 8 + i * 20)
+        if cpu == 0x01000007:
+            binary = framework[off:off + size]
+            if hashlib.sha256(binary).hexdigest() != APPLE_ADI_SHA256:
+                raise ValueError("CoreADI-Version passt nicht (SHA-256)")
+            return binary
+    raise ValueError("Keine x86_64-CoreADI im Installer")
+
+
+class AppleRuntime:
+    """Bereitstellung der macOS-CoreADI und des Emulators für die Apple-Anmeldung."""
+
+    def __init__(self) -> None:
+        self.dir = DATA_DIR / "apple_adi"
+        env = os.environ.get("FMU_MACOS_ADI") or os.environ.get("MACOS_ADI_BINARY")
+        self.binary = Path(env).expanduser() if env else self.dir / "CoreADI.x86_64"
+        self.state = "unknown"      # ready | missing | installing | error | incompatible
+        self.message = ""
+        self.progress = 0.0
+        self._task: asyncio.Task | None = None
+        self._activated = False
+
+    def status(self) -> dict:
+        return {"state": self.state, "message": self.message, "progress": round(self.progress, 3),
+                "binary": str(self.binary)}
+
+    def check(self) -> bool:
+        if _deps_state() != "ok":
+            self.state = "incompatible"
+            self.message = ("Die installierte FindMy.py-Version kennt die neue Apple-Anmeldung nicht. "
+                            "Server einmal ohne --no-bootstrap starten (aktualisiert automatisch).")
+            return False
+        try:
+            ok = self.binary.is_file() and hashlib.sha256(self.binary.read_bytes()).hexdigest() == APPLE_ADI_SHA256
+        except OSError:
+            ok = False
+        if not ok:
+            if self.state not in ("installing", "error"):
+                self.state = "missing"
+                self.message = "macOS-Komponente fehlt – wird einmalig von Apple geladen (~290 MB)."
+            return False
+        self.activate()
+        self.state, self.message, self.progress = "ready", "Bereit", 1.0
+        return True
+
+    def activate(self) -> None:
+        """Emulator-Quellen schreiben und Anisette auf die macOS-CoreADI umstellen."""
+        if self._activated:
+            return
+        pkg = self.dir / "apple_coreadi"
+        pkg.mkdir(parents=True, exist_ok=True)
+        for name, src in APPLE_COREADI_SOURCES.items():
+            target = pkg / name
+            if not target.exists() or target.read_text("utf-8") != src:
+                target.write_text(src, "utf-8")
+        bridge = self.dir / "fmu_apple_adi.py"
+        if not bridge.exists() or bridge.read_text("utf-8") != APPLE_ADI_BRIDGE:
+            bridge.write_text(APPLE_ADI_BRIDGE, "utf-8")
+        if str(self.dir) not in sys.path:
+            sys.path.insert(0, str(self.dir))
+        os.environ["MACOS_ADI_BINARY"] = str(self.binary)
+        import fmu_apple_adi  # type: ignore[import-not-found]
+        fmu_apple_adi.install_itunes_adi_backend()
+        self._activated = True
+
+    def _install_sync(self) -> None:
+        import tempfile
+        import urllib.request
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="fmu-adi-", dir=self.dir) as tmp:
+            dmg = Path(tmp) / "iTunes12.8.3.dmg"
+            self.message = "Lade Apple-Installer (~290 MB) …"
+            req = urllib.request.Request(APPLE_DMG_URL, headers={"User-Agent": f"FindMyUltra/{VERSION}"})
+            h = hashlib.sha256()
+            with urllib.request.urlopen(req, timeout=60) as r, open(dmg, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 291523996)
+                done = 0
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    self.progress = min(0.9, done / total * 0.9)
+            if h.hexdigest() != APPLE_DMG_SHA256:
+                raise ValueError("Apple-Installer: Prüfsumme stimmt nicht – Download beschädigt?")
+            self.message = "Packe macOS-Komponente aus …"
+            import mmap
+            with tempfile.TemporaryFile(dir=tmp) as raw:
+                _udif_to_raw(dmg, raw)
+                raw.flush()
+                with mmap.mmap(raw.fileno(), 0, access=mmap.ACCESS_READ) as blob:
+                    binary = _adi_from_image(blob)
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        secure_write(self.binary, binary)
+
+    def start_install(self) -> None:
+        if self._task and not self._task.done():
+            return
+
+        async def run() -> None:
+            self.state, self.progress = "installing", 0.0
+            try:
+                await asyncio.to_thread(self._install_sync)
+                self.check()
+                log.info("macOS-Komponente für die Apple-Anmeldung eingerichtet.")
+            except Exception as e:  # noqa: BLE001
+                self.state, self.message = "error", f"Einrichtung fehlgeschlagen: {e}"
+                log.warning("Apple-Komponente: %s", e)
+
+        self._task = asyncio.create_task(run())
+
+
+def apple_http_session(provider: Any) -> Any:
+    """HTTP-Sitzung, die bei gsa.apple.com den User-Agent des Mac-Profils sendet."""
+    from findmy.util.http import HttpSession
+
+    class _IdentityHttp(HttpSession):
+        async def request(self, method: str, url: str, **kwargs: Any) -> Any:
+            if urlparse(url).hostname == "gsa.apple.com" and hasattr(provider, "user_agent"):
+                headers = dict(kwargs.get("headers") or {})
+                headers["User-Agent"] = provider.user_agent
+                kwargs["headers"] = headers
+            return await super().request(method, url, **kwargs)
+
+    return _IdentityHttp()
+
+
+def apple_session_is_mac(path: Path) -> bool:
+    """True, wenn die gespeicherte Apple-Sitzung schon die macOS-Identität nutzt."""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        inner = json.loads(base64.b64decode(data["anisette"]["prov_data"]))
+        adi = json.loads(base64.b64decode(inner["adi_pb"]))
+        return adi.get("provider") == "itunes-coreadi"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def apple_has_search_token(acc: Any) -> bool:
+    with contextlib.suppress(Exception):
+        tokens = acc.to_json()["login"]["data"]["mobileme_data"]["tokens"]
+        return bool(tokens.get("searchPartyToken"))
+    return False
+
+
+# Brücke Anisette ↔ CoreADI (aus RJ TrackerApp, Backend/apple_adi.py)
+APPLE_ADI_BRIDGE = r'''"""Anisette V2 bridge for the verified iTunes 4.19 CoreADI build.
+
+A fresh emulator per OTP prevents the upstream long-lived VM exhaustion.
+Only provisioning keeps a VM across start/end; account state embeds the
+machine UUID and ADI files, allowing restart without a fresh registration.
+"""
+import asyncio
+import base64
+import json
+import os
+from pathlib import Path
+from threading import RLock
+import uuid
+
+from anisette._adi import BaseADI, CPIM, OneTimePassword
+from apple_coreadi.adi_run import CoreADI
+
+STORE = '/Users/Shared/adi/'
+
+
+def signed(value):
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def checked(result):
+    if not result.ok:
+        raise RuntimeError(f'Apple CoreADI {result.name} failed ({result.rc}/{result.ret})')
+    return result.outputs
+
+
+class ITunesADI(BaseADI):
+    def __init__(self, identifier, adi_pb):
+        self.identifier = identifier
+        self.lock = RLock()
+        self.pending = None
+        self.files = {}
+        self.host_uuid = uuid.uuid4().bytes
+        self.routing = None
+        if adi_pb:
+            data = json.loads(adi_pb)
+            if data.get('provider') != 'itunes-coreadi' or data.get('version') != 1 or data.get('identifier') != identifier:
+                raise ValueError('Apple ADI session requires a new Apple login')
+            self.host_uuid = bytes.fromhex(data['host_uuid'])
+            if len(self.host_uuid) != 16:
+                raise ValueError('Invalid Apple ADI machine UUID')
+            self.files = {key: base64.b64decode(value, validate=True) for key, value in data['files'].items() if key.startswith(STORE) and key != STORE+'adi.pb'}
+            self.routing = data.get('routing')
+
+    @classmethod
+    def create(cls, url=None):
+        if url is not None:
+            raise ValueError('Use setup_apple_adi.py for the official Apple runtime')
+        return lambda identifier, adi_pb: cls(identifier, adi_pb)
+
+    @property
+    def routing_information(self):
+        return self.routing
+
+    @property
+    def adi_pb(self):
+        with self.lock:
+            return json.dumps({'provider': 'itunes-coreadi', 'version': 1,
+                'identifier': self.identifier, 'host_uuid': self.host_uuid.hex(),
+                'routing': self.routing,
+                'files': {k: base64.b64encode(v).decode() for k,v in self.files.items()}}, sort_keys=True).encode()
+
+    def _core(self):
+        core = CoreADI(Path(os.environ['MACOS_ADI_BINARY']))
+        core.stubs.hostuuid = self.host_uuid
+        core.stubs.files.update({k: bytearray(v) for k,v in self.files.items()})
+        checked(core.initialize())
+        return core
+
+    def _save(self, core):
+        self.files = {k: bytes(v) for k,v in core.stubs.files.items() if k.startswith(STORE) and k != STORE+'adi.pb'}
+
+    async def _run(self, operation):
+        def call():
+            with self.lock:
+                return operation()
+        return await asyncio.get_running_loop().run_in_executor(None, call)
+
+    async def is_machine_provisioned(self, ds_id=(1 << 64)-2):
+        def call():
+            result = self._core().is_machine_provisioned(signed(ds_id))
+            if result.ret == -45061:
+                return False
+            checked(result)
+            return True
+        return await self._run(call)
+
+    async def start_provisioning(self, spim, ds_id=(1 << 64)-2):
+        def call():
+            self.pending = self._core()
+            result = checked(self.pending.provisioning_start(signed(ds_id), spim))
+            return CPIM(result['cpim'], result['session_id'])
+        return await self._run(call)
+
+    async def end_provisioning(self, session, persistent_token_metadata, trust_key):
+        def call():
+            if self.pending is None:
+                raise RuntimeError('No pending Apple ADI provisioning session')
+            try:
+                checked(self.pending.provisioning_end(session, persistent_token_metadata, trust_key))
+                self._save(self.pending)
+            finally:
+                self.pending = None
+        await self._run(call)
+
+    async def set_idms_routing(self, routing_information):
+        def call():
+            core = self._core()
+            checked(core.set_routing(-2, routing_information))
+            self.routing = routing_information
+            self._save(core)
+        await self._run(call)
+
+    async def request_otp(self, ds_id=(1 << 64)-2):
+        def call():
+            core = self._core()
+            result = checked(core.request_otp(signed(ds_id)))
+            self._save(core)
+            return OneTimePassword(otp=result['otp'], machine_id=result['mid'])
+        return await self._run(call)
+
+
+def install_itunes_adi_backend():
+    from anisette import AsyncAnisetteProvider
+    AsyncAnisetteProvider.DEFAULT_ADI = ITunesADI
+'''
+
+# Emulator (MIT, © 2026 sacca – sacca97/os-findmy-e@374d838, tools/machoadi)
+APPLE_COREADI_SOURCES: dict[str, str] = {
+    '__init__.py': r'''"""Vendored MIT-licensed CoreADI emulator; see SOURCE.md."""
+''',
+    'macho.py': r'''"""Minimal Mach-O (64-bit) reader focused on what a Unicorn loader needs.
+
+Only the pieces required to *map* a pre-11.0 Mach-O and resolve its external
+symbols are implemented:
+
+* segments / sections
+* ``LC_SYMTAB`` (for names + symbol classification)
+* classic ``LC_DYLD_INFO[_ONLY]`` rebase / bind / lazy-bind opcode streams
+* the lists of linked dylibs
+
+Chained fixups (macOS 12+), which this corpus predates, are not handled.
+
+All offsets in the bind/rebase streams are decoded with the same state machine
+dyld uses (see dyld's ``ImageLoaderMachOCompressed.cpp``).
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass, field
+
+MH_MAGIC_64 = 0xFEEDFACF
+MH_EXECUTE = 0x2
+MH_DYLIB = 0x6
+
+LC_SEGMENT_64 = 0x19
+LC_SYMTAB = 0x2
+LC_DYSYMTAB = 0xB
+LC_LOAD_DYLIB = 0xC
+LC_ID_DYLIB = 0xD
+LC_LOAD_WEAK_DYLIB = 0x80000018
+LC_REEXPORT_DYLIB = 0x8000001F
+LC_LAZY_LOAD_DYLIB = 0x20
+LC_DYLD_INFO = 0x22
+LC_DYLD_INFO_ONLY = 0x80000022
+LC_CODE_SIGNATURE = 0x1D
+LC_FUNCTION_STARTS = 0x26
+LC_DYLD_EXPORTS_TRIE = 0x80000033
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
+
+# --- bind opcodes ---------------------------------------------------------
+BIND_OPCODE_MASK = 0xF0
+BIND_IMMEDIATE_MASK = 0x0F
+BIND_OPCODE_DONE = 0x00
+BIND_OPCODE_SET_DYLIB_ORDINAL_IMM = 0x10
+BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB = 0x20
+BIND_OPCODE_SET_DYLIB_SPECIAL_IMM = 0x30
+BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM = 0x40
+BIND_OPCODE_SET_TYPE_IMM = 0x50
+BIND_OPCODE_SET_ADDEND_SLEB = 0x60
+BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB = 0x70
+BIND_OPCODE_ADD_ADDR_ULEB = 0x80
+BIND_OPCODE_DO_BIND = 0x90
+BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB = 0xA0
+BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED = 0xB0
+BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB = 0xC0
+BIND_OPCODE_THREADED = 0xD0
+
+BIND_SYMBOL_FLAGS_WEAK_IMPORT = 0x1
+BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION = 0x8
+
+BIND_TYPE_POINTER = 1
+BIND_TYPE_TEXT_ABSOLUTE32 = 2
+BIND_TYPE_TEXT_PCREL32 = 3
+
+# --- rebase opcodes -------------------------------------------------------
+REBASE_OPCODE_MASK = 0xF0
+REBASE_IMMEDIATE_MASK = 0x0F
+REBASE_OPCODE_DONE = 0x00
+REBASE_OPCODE_SET_TYPE_IMM = 0x10
+REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB = 0x20
+REBASE_OPCODE_ADD_ADDR_ULEB = 0x30
+REBASE_OPCODE_ADD_ADDR_IMM_SCALED = 0x40
+REBASE_OPCODE_DO_REBASE_IMM_TIMES = 0x50
+REBASE_OPCODE_DO_REBASE_ULEB_TIMES = 0x60
+REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB = 0x70
+REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB = 0x80
+
+REBASE_TYPE_POINTER = 1
+REBASE_TYPE_TEXT_ABSOLUTE32 = 2
+REBASE_TYPE_TEXT_PCREL32 = 3
+
+_DYLIB_CMD_NAMES = {
+    LC_LOAD_DYLIB: "load",
+    LC_ID_DYLIB: "id",
+    LC_LOAD_WEAK_DYLIB: "weak",
+    LC_REEXPORT_DYLIB: "reexport",
+    LC_LAZY_LOAD_DYLIB: "lazy",
+}
+
+
+def _u(data: bytes, off: int) -> int:
+    return struct.unpack_from("<I", data, off)[0]
+
+
+def _q(data: bytes, off: int) -> int:
+    return struct.unpack_from("<Q", data, off)[0]
+
+
+def read_uleb(data: bytes, off: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while True:
+        byte = data[off]
+        off += 1
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte & 0x80 == 0:
+            return result, off
+
+
+def read_sleb(data: bytes, off: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while True:
+        byte = data[off]
+        off += 1
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte & 0x80 == 0:
+            if shift < 64 and byte & 0x40:
+                result |= -(1 << shift)
+            return result, off
+
+
+def _cstr(data: bytes, off: int) -> str:
+    end = data.index(b"\x00", off)
+    return data[off:end].decode("utf-8", "replace")
+
+
+@dataclass
+class Section:
+    segname: str
+    sectname: str
+    addr: int
+    size: int
+    offset: int
+    align: int
+    flags: int
+
+    @property
+    def qual(self) -> str:
+        return f"{self.segname}.{self.sectname}"
+
+
+@dataclass
+class Segment:
+    name: str
+    vmaddr: int
+    vmsize: int
+    fileoff: int
+    filesize: int
+    maxprot: int
+    initprot: int
+    sections: list[Section] = field(default_factory=list)
+
+
+@dataclass
+class Bind:
+    address: int
+    seg_index: int
+    segname: str
+    ordinal: int
+    symbol: str
+    flags: int
+    addend: int
+    type: int
+    lazy: bool = False
+    library: str | None = None
+
+    @property
+    def weak(self) -> bool:
+        return bool(self.flags & BIND_SYMBOL_FLAGS_WEAK_IMPORT)
+
+
+@dataclass
+class Rebase:
+    address: int
+    seg_index: int
+    segname: str
+    type: int
+
+
+class MachOError(RuntimeError):
+    pass
+
+
+class MachO:
+    def __init__(self, data: bytes, path: str = "") -> None:
+        self.data = data
+        self.path = path
+        self.slices: list[str] = []
+
+        magic = _u(data, 0)
+        if magic == 0xCAFEBABE or magic == 0xBEBAFECA:
+            raise MachOError("fat Mach-O: use the thin slice")
+        if magic != MH_MAGIC_64:
+            raise MachOError(f"not a 64-bit Mach-O (magic={magic:#x})")
+
+        (
+            _magic,
+            self.cputype,
+            self.cpusubtype,
+            self.filetype,
+            self.ncmds,
+            self.sizeofcmds,
+            self.flags,
+            _reserved,
+        ) = struct.unpack_from("<IIIIIIII", data, 0)
+
+        self.segments: list[Segment] = []
+        self.dylibs: list[tuple[int, str]] = []
+        self.symoff = self.nsyms = self.stroff = self.strsize = 0
+        self._dyld_info: dict[str, tuple[int, int]] = {}
+        self._parse_load_commands()
+
+        # Full symtab view.
+        self.symbols: list[tuple[str, int, int, int, int]] = []
+        self._parse_symtab()
+
+    # -- load commands ----------------------------------------------------
+    def _parse_load_commands(self) -> None:
+        off = 32
+        for _ in range(self.ncmds):
+            cmd = _u(self.data, off)
+            cmdsize = _u(self.data, off + 4)
+            if cmd == LC_SEGMENT_64:
+                self._parse_segment(off)
+            elif cmd in _DYLIB_CMD_NAMES:
+                nameoff = _u(self.data, off + 8)
+                name = _cstr(self.data, off + nameoff)
+                if cmd != LC_ID_DYLIB:
+                    self.dylibs.append((cmd, name))
+            elif cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
+                fields = struct.unpack_from("<10I", self.data, off + 8)
+                for i, key in enumerate(["rebase", "bind", "weak_bind", "lazy_bind", "export"]):
+                    self._dyld_info[key] = (fields[i * 2], fields[i * 2 + 1])
+            elif cmd == LC_SYMTAB:
+                (
+                    self.symoff,
+                    self.nsyms,
+                    self.stroff,
+                    self.strsize,
+                ) = struct.unpack_from("<IIII", self.data, off + 8)
+            off += cmdsize
+
+    def _parse_segment(self, off: int) -> None:
+        name = self.data[off + 8 : off + 24].rstrip(b"\x00").decode("ascii", "replace")
+        vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, _flags = struct.unpack_from(
+            "<QQQQIIII", self.data, off + 24
+        )
+        seg = Segment(name, vmaddr, vmsize, fileoff, filesize, maxprot, initprot)
+        so = off + 72
+        for _ in range(nsects):
+            sectname = self.data[so : so + 16].rstrip(b"\x00").decode("ascii", "replace")
+            segname = self.data[so + 16 : so + 32].rstrip(b"\x00").decode("ascii", "replace")
+            addr, size = struct.unpack_from("<QQ", self.data, so + 32)
+            (offset,) = struct.unpack_from("<I", self.data, so + 48)
+            align, _reloff, _nreloc, flags, _r1, _r2, _r3 = struct.unpack_from(
+                "<IIIIIII", self.data, so + 52
+            )
+            seg.sections.append(Section(segname, sectname, addr, size, offset, align, flags))
+            so += 80
+        self.segments.append(seg)
+
+    def _parse_symtab(self) -> None:
+        for i in range(self.nsyms):
+            base = self.symoff + 16 * i
+            strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", self.data, base)
+            name = _cstr(self.data, self.stroff + strx)
+            self.symbols.append((name, n_type, n_sect, n_desc, n_value))
+
+    # -- lookups ----------------------------------------------------------
+    @property
+    def undefined_symbols(self) -> list[tuple[str, int, int]]:
+        """(name, n_desc, n_type) for every N_UNDF|N_EXT symbol."""
+        out = []
+        for name, n_type, _n_sect, n_desc, _value in self.symbols:
+            if n_type & 0x0E == 0x00 and n_type & 0x01:  # N_UNDF | N_EXT
+                out.append((name, n_desc, n_type))
+        return out
+
+    def segment_for(self, addr: int) -> tuple[int, Segment] | None:
+        for i, seg in enumerate(self.segments):
+            if seg.vmaddr <= addr < seg.vmaddr + seg.vmsize:
+                return i, seg
+        return None
+
+    def section_for(self, addr: int) -> Section | None:
+        hit = self.segment_for(addr)
+        if hit is None:
+            return None
+        for sect in hit[1].sections:
+            if sect.addr <= addr < sect.addr + sect.size:
+                return sect
+        return None
+
+    def read_cstr_at(self, addr: int) -> str:
+        seg_i = self.segment_for(addr)
+        if seg_i is None:
+            raise MachOError(f"address {addr:#x} not in any segment")
+        _i, seg = seg_i
+        file_off = seg.fileoff + (addr - seg.vmaddr)
+        return _cstr(self.data, file_off)
+
+    def dylib_name(self, ordinal: int) -> str | None:
+        """ordinal is 1-based index into the load-dylib list."""
+        if 1 <= ordinal <= len(self.dylibs):
+            return self.dylibs[ordinal - 1][1]
+        return None
+
+    # -- dyld info --------------------------------------------------------
+    def _stream(self, name: str) -> tuple[int, int]:
+        return self._dyld_info.get(name, (0, 0))
+
+    def iter_rebases(self) -> list[Rebase]:
+        off, size = self._stream("rebase")
+        if size == 0:
+            return []
+        data = self.data
+        end = off + size
+        out: list[Rebase] = []
+        seg_index = 0
+        seg_offset = 0
+        rtype = REBASE_TYPE_POINTER
+        while off < end:
+            byte = data[off]
+            opcode = byte & REBASE_OPCODE_MASK
+            imm = byte & REBASE_IMMEDIATE_MASK
+            off += 1
+            if opcode == REBASE_OPCODE_DONE:
+                break
+            elif opcode == REBASE_OPCODE_SET_TYPE_IMM:
+                rtype = imm
+            elif opcode == REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                seg_index = imm
+                seg_offset, off = read_uleb(data, off)
+            elif opcode == REBASE_OPCODE_ADD_ADDR_ULEB:
+                val, off = read_uleb(data, off)
+                seg_offset += val
+            elif opcode == REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
+                seg_offset += imm * 8
+            elif opcode == REBASE_OPCODE_DO_REBASE_IMM_TIMES:
+                for _ in range(imm):
+                    out.append(self._mk_rebase(seg_index, seg_offset, rtype))
+                    seg_offset += 8
+            elif opcode == REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
+                count, off = read_uleb(data, off)
+                for _ in range(count):
+                    out.append(self._mk_rebase(seg_index, seg_offset, rtype))
+                    seg_offset += 8
+            elif opcode == REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
+                out.append(self._mk_rebase(seg_index, seg_offset, rtype))
+                val, off = read_uleb(data, off)
+                seg_offset += val + 8
+            elif opcode == REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB:
+                count, off = read_uleb(data, off)
+                skip, off = read_uleb(data, off)
+                for _ in range(count):
+                    out.append(self._mk_rebase(seg_index, seg_offset, rtype))
+                    seg_offset += skip + 8
+            else:
+                raise MachOError(f"bad rebase opcode {opcode:#x} at {off - 1:#x}")
+        return out
+
+    def _mk_rebase(self, seg_index: int, seg_offset: int, rtype: int) -> Rebase:
+        seg = self.segments[seg_index]
+        return Rebase(seg.vmaddr + seg_offset, seg_index, seg.name, rtype)
+
+    def _iter_binds(self, stream: str, lazy: bool) -> list[Bind]:
+        off, size = self._stream(stream)
+        if size == 0:
+            return []
+        data = self.data
+        end = off + size
+
+        out: list[Bind] = []
+        ordinal = 0
+        symbol = ""
+        sym_flags = 0
+        btype = BIND_TYPE_POINTER
+        addend = 0
+        seg_index = 0
+        seg_offset = 0
+        while off < end:
+            byte = data[off]
+            opcode = byte & BIND_OPCODE_MASK
+            imm = byte & BIND_IMMEDIATE_MASK
+            off += 1
+            if opcode == BIND_OPCODE_DONE:
+                if lazy:
+                    # each lazy entry terminates with DONE; keep going
+                    continue
+                break
+            elif opcode == BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+                ordinal = imm
+            elif opcode == BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+                ordinal, off = read_uleb(data, off)
+            elif opcode == BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+                ordinal = imm if imm == 0 else (0xF0 | imm) - 0x100
+            elif opcode == BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+                sym_flags = imm
+                # The symbol name follows inline, NUL-terminated.
+                end_pos = data.index(b"\x00", off)
+                symbol = data[off:end_pos].decode("ascii", "replace")
+                off = end_pos + 1
+            elif opcode == BIND_OPCODE_SET_TYPE_IMM:
+                btype = imm
+            elif opcode == BIND_OPCODE_SET_ADDEND_SLEB:
+                addend, off = read_sleb(data, off)
+            elif opcode == BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                seg_index = imm
+                seg_offset, off = read_uleb(data, off)
+            elif opcode == BIND_OPCODE_ADD_ADDR_ULEB:
+                val, off = read_uleb(data, off)
+                seg_offset = (seg_offset + val) & 0xFFFFFFFFFFFFFFFF
+            elif opcode == BIND_OPCODE_DO_BIND:
+                out.append(self._mk_bind(seg_index, seg_offset, ordinal, symbol, sym_flags, addend, btype, lazy))
+                seg_offset += 8
+            elif opcode == BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+                out.append(self._mk_bind(seg_index, seg_offset, ordinal, symbol, sym_flags, addend, btype, lazy))
+                val, off = read_uleb(data, off)
+                seg_offset = (seg_offset + val + 8) & 0xFFFFFFFFFFFFFFFF
+            elif opcode == BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+                out.append(self._mk_bind(seg_index, seg_offset, ordinal, symbol, sym_flags, addend, btype, lazy))
+                seg_offset += imm * 8 + 8
+            elif opcode == BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
+                count, off = read_uleb(data, off)
+                skip, off = read_uleb(data, off)
+                for _ in range(count):
+                    out.append(self._mk_bind(seg_index, seg_offset, ordinal, symbol, sym_flags, addend, btype, lazy))
+                    seg_offset += skip + 8
+            elif opcode == BIND_OPCODE_THREADED:
+                raise MachOError("threaded bind opcode (chained fixups) is not supported")
+            else:
+                raise MachOError(f"bad bind opcode {opcode:#x} at {off - 1:#x}")
+        return out
+
+    def _mk_bind(
+        self,
+        seg_index: int,
+        seg_offset: int,
+        ordinal: int,
+        symbol: str,
+        flags: int,
+        addend: int,
+        btype: int,
+        lazy: bool,
+    ) -> Bind:
+        seg = self.segments[seg_index]
+        return Bind(
+            address=seg.vmaddr + seg_offset,
+            seg_index=seg_index,
+            segname=seg.name,
+            ordinal=ordinal,
+            symbol=symbol,
+            flags=flags,
+            addend=addend,
+            type=btype,
+            lazy=lazy,
+            library=self.dylib_name(ordinal) if ordinal > 0 else None,
+        )
+
+    def iter_binds(self) -> list[Bind]:
+        return self._iter_binds("bind", lazy=False)
+
+    def iter_lazy_binds(self) -> list[Bind]:
+        return self._iter_binds("lazy_bind", lazy=True)
+
+    def all_binds(self) -> list[Bind]:
+        return self.iter_binds() + self.iter_lazy_binds()
+
+    def bind_symbols(self) -> list[str]:
+        seen: dict[str, None] = {}
+        for b in self.all_binds():
+            seen.setdefault(b.symbol, None)
+        return list(seen)
+''',
+    'harness.py': r'''"""Unicorn-backed x86_64 Mach-O runtime for the Mac CoreADI whitebox.
+
+This runs Apple's own (old, Intel, pre-chained-fixups) CoreADI binary under
+emulation, so that its ADI dispatcher can be called from Python.
+
+Loading strategy
+----------------
+The dylib's preferred base is 0, so we map every segment at its literal
+``vmaddr`` and skip rebasing entirely (slide == 0). Import slots (dyld binds)
+are redirected to a synthetic stub page: each imported symbol gets a unique
+address holding ``ret``; a code hook fires on the way in, runs a Python handler,
+and the ``ret`` returns to the caller (correct for both ``call`` and tail-call
+``jmp`` positions).
+
+Data imports (``kCF*`` constants, ``___stack_chk_guard``, ...) instead point at
+a per-symbol 8-byte cell so normal dereferences see a plausible object.
+"""
+
+from __future__ import annotations
+
+import logging
+import struct
+from collections.abc import Callable
+from typing import Any
+
+from unicorn import (
+    UC_ARCH_X86,
+    UC_HOOK_CODE,
+    UC_HOOK_MEM_FETCH_UNMAPPED,
+    UC_HOOK_MEM_READ_UNMAPPED,
+    UC_HOOK_MEM_WRITE_UNMAPPED,
+    UC_MEM_FETCH_UNMAPPED,
+    UC_MEM_READ_UNMAPPED,
+    UC_MEM_WRITE_UNMAPPED,
+    UC_MODE_64,
+    Uc,
+)
+from unicorn.x86_const import (
+    UC_X86_REG_EFLAGS,
+    UC_X86_REG_R10,
+    UC_X86_REG_R11,
+    UC_X86_REG_R12,
+    UC_X86_REG_R13,
+    UC_X86_REG_R14,
+    UC_X86_REG_R15,
+    UC_X86_REG_R8,
+    UC_X86_REG_R9,
+    UC_X86_REG_RAX,
+    UC_X86_REG_RBP,
+    UC_X86_REG_RBX,
+    UC_X86_REG_RCX,
+    UC_X86_REG_RDI,
+    UC_X86_REG_RDX,
+    UC_X86_REG_RIP,
+    UC_X86_REG_RSI,
+    UC_X86_REG_RSP,
+)
+
+from .macho import MachO
+
+logger = logging.getLogger(__name__)
+
+PAGE = 0x1000
+
+# --- emulator address layout (kept well clear of the 0-based image) --------
+RETURN_ADDRESS = 0x40000000
+HEAP_ADDRESS = 0x40010000
+HEAP_SIZE = 0x01000000
+STACK_ADDRESS = 0x50000000
+STACK_SIZE = 0x00200000
+STUB_ADDRESS = 0x60000000
+STUB_SIZE = 0x00020000
+DATA_ADDRESS = 0x60020000
+DATA_SIZE = 0x00020000
+SCRATCH_ADDRESS = 0x60040000
+SCRATCH_SIZE = 0x00040000
+OBJECT_ADDRESS = 0x60080000
+OBJECT_SIZE = 0x00040000
+
+_STUB_SLOT = 0x10  # bytes between adjacent stubs
+_RET = b"\xc3"
+
+# Imports that denote a *variable* rather than a function entry point.
+# Keys are normalised (leading Mach-O underscores stripped).
+_DATA_SYMBOLS = {
+    "stack_chk_guard",
+    "kCFAllocatorDefault",
+    "kCFBooleanFalse",
+    "kCFBooleanTrue",
+    "kCFErrorDomainOSStatus",
+    "kCFURLFileSecurityKey",
+    "kCFURLIsDirectoryKey",
+    "kCFURLIsHiddenKey",
+    "kCFURLTypeIdentifierKey",
+    "kUTTypePlainText",
+}
+
+
+def _norm(symbol: str) -> str:
+    """Strip Mach-O's leading underscores for handler/table lookup."""
+    return symbol.lstrip("_")
+
+
+def _is_data_symbol(symbol: str) -> bool:
+    return _norm(symbol) in _DATA_SYMBOLS
+
+_ARG_REGS = (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX, UC_X86_REG_R8, UC_X86_REG_R9)
+
+
+class EmulationError(RuntimeError):
+    pass
+
+
+class UnmappedAccess(EmulationError):
+    pass
+
+
+class MachOImage:
+    def __init__(self, path: str, data: bytes | None = None) -> None:
+        self.path = path
+        if data is None:
+            with open(path, "rb") as image_file:
+                data = image_file.read()
+        self.data = data
+        self.macho = MachO(self.data, path)
+
+    def map_into(self, uc: Uc) -> None:
+        for seg in self.macho.segments:
+            start = seg.vmaddr
+            size = (seg.vmsize + PAGE - 1) // PAGE * PAGE
+            if size == 0:
+                continue
+            uc.mem_map(start, size)
+            if seg.filesize:
+                blob = self.data[seg.fileoff : seg.fileoff + seg.filesize]
+                uc.mem_write(start, blob.ljust(min(seg.vmsize, seg.filesize), b"\x00"))
+
+
+class Harness:
+    def __init__(self, image: MachOImage, *, log_stubs: bool = False, apply_binds: bool = True) -> None:
+        self.image = image
+        self.log_stubs = log_stubs
+        self.fault: dict[str, int | str] | None = None
+        self._fault_count = 0
+        self._permissive = False
+        self._max_faults = 64
+        self._faults = 0
+        self.uc = Uc(UC_ARCH_X86, UC_MODE_64)
+
+        self._handlers: dict[str, Callable[[Harness], int | None]] = {}
+        self._stub_addr: dict[str, int] = {}
+        self._stub_by_index: dict[int, str] = {}
+        self._data_addr: dict[str, int] = {}
+        self._resolved: dict[int, str] = {}  # bind location -> symbol
+        self._heap_cur = HEAP_ADDRESS
+        self._scratch_cur = SCRATCH_ADDRESS
+        self._obj_cur = OBJECT_ADDRESS
+        self._calls: list[str] = []
+        self._permissive_pages: set[int] = set()
+
+        self._map_all()
+        self._setup_stubs()
+        self._install_default_handlers()
+        if apply_binds:
+            self._apply_binds()
+        self._install_hooks()
+
+    # -- setup ------------------------------------------------------------
+    def _map_all(self) -> None:
+        uc = self.uc
+        uc.mem_map(RETURN_ADDRESS, PAGE)
+        uc.mem_map(HEAP_ADDRESS, HEAP_SIZE)
+        uc.mem_map(STACK_ADDRESS, STACK_SIZE)
+        uc.mem_map(STUB_ADDRESS, STUB_SIZE)
+        uc.mem_map(DATA_ADDRESS, DATA_SIZE)
+        uc.mem_map(SCRATCH_ADDRESS, SCRATCH_SIZE)
+        uc.mem_map(OBJECT_ADDRESS, OBJECT_SIZE)
+        self.image.map_into(uc)
+
+    def _setup_stubs(self) -> None:
+        self.uc.mem_write(STUB_ADDRESS, _RET * STUB_SIZE)
+        for i, sym in enumerate(self.image.macho.bind_symbols()):
+            if _is_data_symbol(sym):
+                cell = DATA_ADDRESS + i * _STUB_SLOT
+                self._data_addr[sym] = cell
+                self.uc.mem_write(cell, struct.pack("<Q", OBJECT_ADDRESS + i * _STUB_SLOT))
+            else:
+                addr = STUB_ADDRESS + i * _STUB_SLOT
+                self._stub_addr[sym] = addr
+                self._stub_by_index[addr] = sym
+
+    def _apply_binds(self) -> None:
+        for bind in self.image.macho.all_binds():
+            sym = bind.symbol
+            if sym in self._data_addr:
+                target = self._data_addr[sym]
+            elif sym in self._stub_addr:
+                target = self._stub_addr[sym]
+            else:
+                # Not in the exported bind list (defensive): allocate a fresh stub.
+                target = STUB_ADDRESS + (len(self._stub_addr) + 0x800) * _STUB_SLOT
+                self._stub_addr[sym] = target
+                self._stub_by_index[target] = sym
+            # dyld semantics: the loader stores ``symbol + addend`` and the
+            # whitebox later recovers the symbol with ``slot - addend``.  We
+            # must reproduce that masking, otherwise the VM dereferences
+            # ``stub - addend`` and runs off into unmapped memory.
+            value = (target + bind.addend) & 0xFFFFFFFFFFFFFFFF
+            self.uc.mem_write(bind.address, struct.pack("<Q", value))
+            self._resolved[bind.address] = sym
+
+    def _install_hooks(self) -> None:
+        uc = self.uc
+        uc.hook_add(UC_HOOK_CODE, self._hook_code, None, STUB_ADDRESS, STUB_ADDRESS + STUB_SIZE - 1)
+        uc.hook_add(
+            UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
+            self._hook_invalid,
+        )
+
+    def _install_default_handlers(self) -> None:
+        self.register("___stack_chk_fail", lambda h: self._abort("stack check failed"))
+        for name in ("pthread_rwlock_init", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
+                     "pthread_rwlock_unlock", "pthread_rwlock_destroy"):
+            self.register(name, lambda h: 0)
+        self.register("getuid", lambda h: 501)  # _fpsd-ish uid; deterministic
+        self.register("umask", lambda h: 0o022)
+        self.register("arc4random", lambda h: 0x12345678)
+        self.register("gethostuuid", self._gethostuuid)
+        self.register("gettimeofday", self._gettimeofday)
+        self.register("___error", self._errno_ptr)
+        self.register("objc_msgSend", self._objc_msgSend)
+        self.register("NSVersionOfRunTimeLibrary", lambda h: 0)
+        self.register("CFErrorGetCode", lambda h: -1)
+        self.register("CFErrorGetDomain", lambda h: 0)
+        self.register("CFRelease", lambda h: 0)
+        self.register("CSBackupIsItemExcluded", lambda h: 0)
+        self.register("CSBackupSetItemExcluded", lambda h: 0)
+        self.register("CFFileSecuritySetMode", lambda h: 1)
+        self.register("malloc", self._malloc)
+        self.register("free", self._free)
+
+    # -- public API -------------------------------------------------------
+    def register(self, symbol: str, handler: Callable[[Harness], int | None]) -> None:
+        self._handlers[_norm(symbol)] = handler
+
+    def mem_read(self, addr: int, size: int) -> bytes:
+        return bytes(self.uc.mem_read(addr, size))
+
+    def mem_write(self, addr: int, data: bytes) -> None:
+        self.uc.mem_write(addr, data)
+
+    def read_u64(self, addr: int) -> int:
+        return struct.unpack("<Q", self.mem_read(addr, 8))[0]
+
+    def read_u32(self, addr: int) -> int:
+        return struct.unpack("<I", self.mem_read(addr, 4))[0]
+
+    def write_u64(self, addr: int, value: int) -> None:
+        self.mem_write(addr, struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF))
+
+    def write_u32(self, addr: int, value: int) -> None:
+        self.mem_write(addr, struct.pack("<I", value & 0xFFFFFFFF))
+
+    def read_cstr(self, addr: int, max_len: int = 0x1000) -> str:
+        out = bytearray()
+        while len(out) < max_len:
+            b = self.mem_read(addr + len(out), 1)
+            if b == b"\x00":
+                break
+            out += b
+        return out.decode("utf-8", "replace")
+
+    def scratch(self, size: int) -> int:
+        size = (size + 0xF) & ~0xF
+        addr = self._scratch_cur
+        self._scratch_cur += size
+        return addr
+
+    def object(self, size: int) -> int:
+        size = (size + 0xF) & ~0xF
+        addr = self._obj_cur
+        self._obj_cur += size
+        return addr
+
+    def invoke(self, address: int, args: list[int], *, permissive: bool = False, max_faults: int = 64) -> int:
+        uc = self.uc
+        for reg, value in zip(_ARG_REGS, args):
+            uc.reg_write(reg, value)
+        rsp = STACK_ADDRESS + STACK_SIZE - 0x1000
+        self.write_u64(rsp, RETURN_ADDRESS)
+        uc.reg_write(UC_X86_REG_RSP, rsp)
+        uc.reg_write(UC_X86_REG_RBP, 0)
+
+        self._permissive = permissive
+        self._max_faults = max_faults
+        self._faults = 0
+        try:
+            uc.emu_start(address, RETURN_ADDRESS, timeout=0, count=0)
+        except Exception as exc:  # noqa: BLE001
+            fault = self.fault
+            self.fault = None
+            raise EmulationError(
+                f"emulation failed at rip={uc.reg_read(UC_X86_REG_RIP):#x}: {exc}"
+            ) from exc
+        finally:
+            self._permissive = False
+        return uc.reg_read(UC_X86_REG_RAX)
+
+    def _map_page(self, page: int) -> None:
+        if page in self._permissive_pages:
+            return
+        self._permissive_pages.add(page)
+        try:
+            self.uc.mem_map(page, PAGE)
+        except Exception:  # noqa: BLE001
+            return
+
+    def stack_trace(self) -> list[int]:
+        return list(self._calls)
+
+    # -- hooks ------------------------------------------------------------
+    def _hook_code(self, uc: Uc, address: int, size: int, _user: Any) -> None:
+        sym = self._stub_by_index.get(address)
+        if sym is None:
+            return
+        self._calls.append(sym)
+        handler = self._handlers.get(_norm(sym))
+        if handler is None:
+            if self.log_stubs:
+                logger.info("stub %s (unhandled) -> 0", sym)
+            return
+        result = handler(self)
+        if result is not None:
+            uc.reg_write(UC_X86_REG_RAX, result & 0xFFFFFFFFFFFFFFFF)
+
+    def _hook_invalid(self, uc: Uc, access: int, address: int, size: int, value: int, _user: Any) -> bool:
+        self._fault_count += 1
+        kind = {
+            UC_MEM_READ_UNMAPPED: "read-unmapped",
+            UC_MEM_WRITE_UNMAPPED: "write-unmapped",
+            UC_MEM_FETCH_UNMAPPED: "fetch-unmapped",
+        }.get(access, f"access-{access}")
+        if self._permissive and kind.endswith("unmapped"):
+            # The VM deliberately reads memory near the dyld-bound imports
+            # (`*(symbol + addend - D)`), which only exists on a real macOS
+            # shared cache. Materialise the page and let the access retry.
+            self._faults += 1
+            if self._faults > self._max_faults:
+                raise EmulationError(f"too many faults ({self._faults})")
+            self._map_page(address & ~(PAGE - 1))
+            return True
+        self.fault = {
+            "kind": kind,
+            "address": address,
+            "size": size,
+            "rip": uc.reg_read(UC_X86_REG_RIP),
+            "rax": uc.reg_read(UC_X86_REG_RAX),
+            "rbx": uc.reg_read(UC_X86_REG_RBX),
+            "rcx": uc.reg_read(UC_X86_REG_RCX),
+            "rdx": uc.reg_read(UC_X86_REG_RDX),
+            "rsi": uc.reg_read(UC_X86_REG_RSI),
+            "rdi": uc.reg_read(UC_X86_REG_RDI),
+            "r8": uc.reg_read(UC_X86_REG_R8),
+            "r9": uc.reg_read(UC_X86_REG_R9),
+            "rbp": uc.reg_read(UC_X86_REG_RBP),
+            "rsp": uc.reg_read(UC_X86_REG_RSP),
+        }
+        raise UnmappedAccess(f"{kind} at {address:#x} (size {size}) rip={self.fault['rip']:#x}")
+
+    # -- handlers ---------------------------------------------------------
+    def _abort(self, message: str) -> int:
+        raise EmulationError(message)
+
+    def _malloc(self, h: Harness) -> int:
+        size = h.uc.reg_read(UC_X86_REG_RDI)
+        addr = h._heap_cur
+        h._heap_cur = (h._heap_cur + max(size, 0x20) + 0xF) & ~0xF
+        return addr
+
+    def _free(self, h: Harness) -> int:
+        return 0
+
+    def _errno_ptr(self, h: Harness) -> int:
+        if not hasattr(h, "_errno_addr"):
+            h._errno_addr = h.scratch(8)
+            h.write_u64(h._errno_addr, 0)
+        return h._errno_addr
+
+    def _gethostuuid(self, h: Harness) -> int:
+        out = h.uc.reg_read(UC_X86_REG_RDI)
+        # A stable, obviously-synthetic UUID; caller-controlled in real use.
+        h.mem_write(out, bytes.fromhex("41444d414341444941444d4143414449")[:16].ljust(16, b"\x00"))
+        return 0
+
+    def _gettimeofday(self, h: Harness) -> int:
+        tv = h.uc.reg_read(UC_X86_REG_RDI)
+        if tv:
+            h.write_u64(tv, 1700000000)
+            h.write_u64(tv + 8, 0)
+        return 0
+
+    _SEL_CACHE: dict[int, str] = {}
+
+    def _objc_msgSend(self, h: Harness) -> int:
+        sel = h.uc.reg_read(UC_X86_REG_RSI)
+        name = h.read_cstr(sel)
+        if h.log_stubs:
+            logger.info("objc_msgSend sel=%s", name)
+        if name == "processInfo":
+            return h.object(0x100)
+        if name == "operatingSystem":
+            return 0x0D  # NSMavericks? see caller intent; logged for tuning
+        if name == "isOperatingSystemAtLeastVersion:":
+            return 1
+        return 0
+''',
+    'stubs.py': r'''"""POSIX / CoreFoundation / Foundation stubs for the Mac CoreADI whitebox.
+
+The dylib is a normal macOS userland component: once its imports are bound it
+talks to libc (open/read/write/lstat/...), CoreFoundation (CFURL resource
+properties) and a little Objective-C (NSProcessInfo) to decide where its
+provisioning store lives and whether the machine already has an ADI blob.
+
+Everything here is a *surrogate* for the host operating system, not a
+reimplementation of ADI: the virtual filesystem is what a real Mac would have
+under ``/Users/Shared/adi``, and the errno/stat plumbing mirrors BSD.
+"""
+
+from __future__ import annotations
+
+import errno as _errno
+import os
+import struct
+import time
+import zlib
+from typing import TYPE_CHECKING
+
+from unicorn.x86_const import (
+    UC_X86_REG_RDI,
+    UC_X86_REG_RSI,
+    UC_X86_REG_RDX,
+    UC_X86_REG_RCX,
+    UC_X86_REG_R8,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .harness import Harness
+
+# macOS/x86_64 `struct stat` (the $INODE64 variant) is 144 bytes.
+STAT_SIZE = 144
+# macOS/x86_64 `struct statfs` is 2168 bytes; only the first fields matter here.
+STATFS_SIZE = 2168
+
+S_IFMT = 0o170000
+S_IFDIR = 0o040000
+S_IFREG = 0o100000
+
+O_RDONLY = 0x0000
+O_WRONLY = 0x0001
+O_RDWR = 0x0002
+O_CREAT = 0x0200
+O_TRUNC = 0x0400
+O_EXCL = 0x0800
+
+_PROVISIONING_DIR = "/Users/Shared/adi"
+
+
+class MacStubs:
+    """A tiny synthetic macOS userland for the emulated CoreADI."""
+
+    def __init__(self, harness: "Harness", *, log: bool = False) -> None:
+        self.h = harness
+        self.log = log
+        self.files: dict[str, bytearray] = {}
+        self.dirs: set[str] = {"/", "/Users", "/Users/Shared", _PROVISIONING_DIR}
+        self.fds: dict[int, dict] = {}
+        self.next_fd = 3
+        self.urls: dict[int, str] = {}
+        self._next_url = 0x60080000
+        self._errno_addr: int | None = None
+        self.home = "/Users/aditest"
+        self.hostuuid = bytes.fromhex("00112233445566778899aabbccddeeff")
+        # The whitebox loads a global such as `kCFURLIsDirectoryKey` as
+        # `*(slot - mask)`, i.e. it sees the *object pointer* the cell holds,
+        # not the cell address.  Build the reverse map it actually compares on.
+        self.key_by_object = {
+            harness.read_u64(cell): sym for sym, cell in harness._data_addr.items()
+        }
+        self._install()
+
+    # -- helpers ----------------------------------------------------------
+    def _a(self, index: int) -> int:
+        regs = (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX, UC_X86_REG_R8)
+        return self.h.uc.reg_read(regs[index])
+
+    def _s(self, addr: int, limit: int = 4096) -> str:
+        try:
+            return self.h.read_cstr(addr, limit)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _errno(self) -> int:
+        if self._errno_addr is None:
+            self._errno_addr = self.h.scratch(8)
+        return self._errno_addr
+
+    def set_errno(self, value: int) -> None:
+        self.h.write_u32(self._errno(), value)
+
+    def errno_ptr(self, h: "Harness") -> int:
+        """`___error()` -- the address the caller dereferences to read errno."""
+        return self._errno()
+
+    def _fail(self, err: int) -> int:
+        self.set_errno(err)
+        return -1
+
+    def _note(self, msg: str) -> None:
+        if self.log:
+            print("      [fs]", msg, flush=True)
+
+    # -- virtual filesystem ----------------------------------------------
+    def _exists(self, path: str) -> bool:
+        return path in self.files or path in self.dirs
+
+    def _inode(self, path: str) -> int:
+        """A stable, per-path inode.
+
+        The store logic compares entries by inode, so a single shared value
+        makes distinct files look like hard links of one another.
+        """
+        return 0x10000 + (zlib.crc32(path.encode()) & 0xFFFFF)
+
+    def _fill_stat(self, addr: int, path: str, *, is_dir: bool, size: int = 0) -> None:
+        buf = bytearray(STAT_SIZE)
+        struct.pack_into("<I", buf, 0, 0x1000003)          # st_dev
+        struct.pack_into("<H", buf, 4, (S_IFDIR if is_dir else S_IFREG) | 0o755)
+        struct.pack_into("<H", buf, 6, 2 if is_dir else 1)  # st_nlink
+        struct.pack_into("<Q", buf, 8, self._inode(path))   # st_ino
+        struct.pack_into("<I", buf, 16, 501)               # st_uid
+        struct.pack_into("<I", buf, 20, 20)                # st_gid
+        struct.pack_into("<q", buf, 96, size)              # st_size
+        struct.pack_into("<q", buf, 104, (size + 511) // 512)
+        struct.pack_into("<i", buf, 112, 4096)             # st_blksize
+        self.h.mem_write(addr, bytes(buf))
+
+    # -- registration -----------------------------------------------------
+    def _install(self) -> None:
+        h = self.h
+        h.register("open", self.open)
+        h.register("close", self.close)
+        h.register("read", self.read)
+        h.register("write", self.write)
+        h.register("lstat$INODE64", self.lstat)
+        h.register("stat$INODE64", self.lstat)
+        h.register("fstat$INODE64", self.fstat)
+        h.register("statfs$INODE64", self.statfs)
+        h.register("mkdir", self.mkdir)
+        h.register("unlink", self.unlink)
+        h.register("chmod", self.chmod)
+        h.register("fchmod", self.fchmod)
+        h.register("fcntl", self.fcntl)
+        h.register("ftruncate", self.ftruncate)
+        h.register("lockf", self.lockf)
+        h.register("getenv", self.getenv)
+        h.register("gettimeofday", self.gettimeofday)
+        h.register("gethostuuid", self.gethostuuid)
+        h.register("___error", self.errno_ptr)
+        h.register("notify_post", lambda hh: 0)
+        h.register("umask", lambda hh: 0o022)
+        h.register("getuid", lambda hh: 501)
+        h.register("arc4random", self.arc4random)
+        h.register("arc4random_buf", self.arc4random_buf)
+        h.register("NSVersionOfRunTimeLibrary", lambda hh: 0x10000_0000)
+        h.register("CSBackupIsItemExcluded", lambda hh: 0)
+        h.register("CSBackupSetItemExcluded", lambda hh: 1)
+        h.register("CFFileSecuritySetMode", lambda hh: 1)
+        h.register("CFRelease", lambda hh: 0)
+        h.register("CFErrorGetCode", lambda hh: 0)
+        h.register("CFErrorGetDomain", lambda hh: 0)
+        h.register("CFURLCreateFromFileSystemRepresentation", self.cfurl_create)
+        h.register("CFURLCopyResourcePropertyForKey", self.cfurl_copy_prop)
+        h.register("CFURLSetResourcePropertyForKey", self.cfurl_set_prop)
+        h.register("objc_msgSend", self.objc_msgSend)
+
+    # -- libc -------------------------------------------------------------
+    def open(self, h: "Harness") -> int:
+        path = self._s(self._a(0))
+        flags = self._a(1)
+        self._note(f"open({path!r}, {flags:#x})")
+        if path in self.files:
+            if flags & O_TRUNC:
+                self.files[path] = bytearray()
+        elif flags & O_CREAT:
+            self.files[path] = bytearray()
+        elif path in self.dirs:
+            return self._fail(_errno.EISDIR)
+        else:
+            return self._fail(_errno.ENOENT)
+        fd = self.next_fd
+        self.next_fd += 1
+        self.fds[fd] = {"path": path, "off": 0, "flags": flags}
+        return fd
+
+    def close(self, h: "Harness") -> int:
+        self.fds.pop(self._a(0), None)
+        return 0
+
+    def read(self, h: "Harness") -> int:
+        fd, buf, n = self._a(0), self._a(1), self._a(2)
+        info = self.fds.get(fd)
+        if info is None:
+            return self._fail(_errno.EBADF)
+        data = self.files.get(info["path"], bytearray())
+        chunk = bytes(data[info["off"]: info["off"] + n])
+        self.h.mem_write(buf, chunk)
+        info["off"] += len(chunk)
+        return len(chunk)
+
+    def write(self, h: "Harness") -> int:
+        fd, buf, n = self._a(0), self._a(1), self._a(2)
+        info = self.fds.get(fd)
+        if info is None:
+            return self._fail(_errno.EBADF)
+        data = self.files.setdefault(info["path"], bytearray())
+        payload = self.h.mem_read(buf, n)
+        off = info["off"]
+        if off > len(data):
+            data.extend(b"\x00" * (off - len(data)))
+        data[off: off + len(payload)] = payload
+        info["off"] = off + len(payload)
+        self._note(f"write({info['path']!r}, {n}B) -> size {len(data)}")
+        return n
+
+    def lstat(self, h: "Harness") -> int:
+        path = self._s(self._a(0))
+        buf = self._a(1)
+        if path in self.files:
+            self._fill_stat(buf, path, is_dir=False, size=len(self.files[path]))
+            self._note(f"lstat({path!r}) -> file {len(self.files[path])}B")
+            return 0
+        if path in self.dirs:
+            self._fill_stat(buf, path, is_dir=True)
+            return 0
+        self._note(f"lstat({path!r}) -> ENOENT")
+        return self._fail(_errno.ENOENT)
+
+    def fstat(self, h: "Harness") -> int:
+        fd, buf = self._a(0), self._a(1)
+        info = self.fds.get(fd)
+        if info is None:
+            return self._fail(_errno.EBADF)
+        size = len(self.files.get(info["path"], b""))
+        self._fill_stat(buf, info["path"], is_dir=False, size=size)
+        return 0
+
+    def statfs(self, h: "Harness") -> int:
+        buf = self._a(1)
+        raw = bytearray(STATFS_SIZE)
+        struct.pack_into("<I", raw, 0, 0x1000003)  # f_bsize etc. left zero
+        self.h.mem_write(buf, bytes(raw))
+        return 0
+
+    def mkdir(self, h: "Harness") -> int:
+        path = self._s(self._a(0))
+        self._note(f"mkdir({path!r})")
+        if self._exists(path):
+            return self._fail(_errno.EEXIST)
+        self.dirs.add(path)
+        return 0
+
+    def unlink(self, h: "Harness") -> int:
+        path = self._s(self._a(0))
+        self._note(f"unlink({path!r})")
+        if path in self.files:
+            del self.files[path]
+            return 0
+        return self._fail(_errno.ENOENT)
+
+    def chmod(self, h: "Harness") -> int:
+        return 0 if self._exists(self._s(self._a(0))) else self._fail(_errno.ENOENT)
+
+    def fchmod(self, h: "Harness") -> int:
+        return 0
+
+    def fcntl(self, h: "Harness") -> int:
+        return 0
+
+    def ftruncate(self, h: "Harness") -> int:
+        fd, length = self._a(0), self._a(1)
+        info = self.fds.get(fd)
+        if info is None:
+            return self._fail(_errno.EBADF)
+        data = self.files.setdefault(info["path"], bytearray())
+        del data[length:]
+        data.extend(b"\x00" * (length - len(data)))
+        return 0
+
+    def lockf(self, h: "Harness") -> int:
+        return 0
+
+    def getenv(self, h: "Harness") -> int:
+        name = self._s(self._a(0))
+        values = {"HOME": self.home, "USER": "aditest", "TMPDIR": "/tmp/"}
+        self._note(f"getenv({name!r})")
+        value = values.get(name)
+        if value is None:
+            return 0
+        addr = self.h.scratch(len(value) + 1)
+        self.h.mem_write(addr, value.encode() + b"\x00")
+        return addr
+
+    def gettimeofday(self, h: "Harness") -> int:
+        tv = self._a(0)
+        if tv:
+            # Real time by default. A frozen clock makes the whitebox OTP a constant, which Apple accepts
+            # for only ~a minute after provisioning (EVIDENCE.md sections 8, 9). ADI_FROZEN_TIME=1 restores
+            # the old behaviour (deterministic traces, reproducing the lease).
+            now = 1700000000 if os.environ.get("ADI_FROZEN_TIME") else time.time()
+            self.h.write_u64(tv, int(now))
+            self.h.write_u64(tv + 8, int((now % 1) * 1_000_000))
+        return 0
+
+    def gethostuuid(self, h: "Harness") -> int:
+        out = self._a(0)
+        self.h.mem_write(out, self.hostuuid)
+        self._note(f"gethostuuid -> {self.hostuuid.hex()}")
+        return 0
+
+    def arc4random(self, h: "Harness") -> int:
+        return 0x12345678
+
+    def arc4random_buf(self, h: "Harness") -> int:
+        buf, n = self._a(0), self._a(1)
+        self.h.mem_write(buf, bytes((i * 7 + 3) & 0xFF for i in range(n)))
+        return 0
+
+    # -- CoreFoundation ---------------------------------------------------
+    def cfurl_create(self, h: "Harness") -> int:
+        buf, length, is_dir = self._a(1), self._a(2), self._a(3)
+        path = self.h.mem_read(buf, length).decode("utf-8", "replace")
+        self._next_url += 0x10
+        self.urls[self._next_url] = path
+        self._note(f"CFURLCreate({path!r}, dir={bool(is_dir)}) -> {self._next_url:#x}")
+        return self._next_url
+
+    def _key_name(self, key: int) -> str | None:
+        name = self.key_by_object.get(key)
+        return None if name is None else name.lstrip("_")
+
+    def cfurl_copy_prop(self, h: "Harness") -> int:
+        url, key, out = self._a(0), self._a(1), self._a(2)
+        path = self.urls.get(url, f"<{url:#x}>")
+        name = self._key_name(key)
+        self._note(f"CFURLGet({path!r}, {name})")
+        is_dir = path in self.dirs
+        true_val = self.h.read_u64(h._data_addr["_kCFBooleanTrue"])
+        false_val = self.h.read_u64(h._data_addr["_kCFBooleanFalse"])
+        if name == "kCFURLIsDirectoryKey":
+            self.h.write_u64(out, true_val if is_dir else false_val)
+            return 1
+        if name == "kCFURLIsHiddenKey":
+            self.h.write_u64(out, false_val)
+            return 1
+        if name in ("kCFURLFileSecurityKey", "kCFURLTypeIdentifierKey"):
+            self.h.write_u64(out, 0x60080000)
+            return 1
+        return 0
+
+    def cfurl_set_prop(self, h: "Harness") -> int:
+        return 1
+
+    def objc_msgSend(self, h: "Harness") -> int:
+        sel = self.h.read_cstr(self._a(1))
+        self._note(f"objc_msgSend({sel!r})")
+        if sel == "processInfo":
+            return self.h.object(0x100)
+        if sel == "operatingSystem":
+            return 0x0D
+        if sel == "isOperatingSystemAtLeastVersion:":
+            return 1
+        return 0
+''',
+    'adi_run.py': r'''#!/usr/bin/env python3
+"""Drive Apple's genuine Mac CoreADI whitebox under Unicorn (Linux).
+
+Nothing about the ADI algorithm is reimplemented here: the Mach-O
+``CoreADI.framework`` slice is mapped at its literal vmaddr and executed by
+Unicorn, with a synthetic macOS userland (libc + CoreFoundation + a few ObjC
+selectors) provided by ``stubs.MacStubs``.
+
+The wire format between the caller and the dispatcher export
+``_vdfut768ig(function_code, CoreADIParameters *)`` follows Dadoum/apple-crates
+(`adi/src/core_adi.rs`, `adi/src/calls.rs`) -- the same framing the genuine
+Windows/Android builds use:
+
+    payload[0:4]   u32 big-endian encryption_type (1 = Clear)
+    payload[4:8]   u32 big-endian marker (1)
+    payload[8:]    bincode request message, fixed-int, big-endian
+    CoreADIParameters { u8* payload; u32 input_size; u32 output_size; u32 flags; }
+
+Pointers inside the message are serialised as their 8-byte big-endian numeric
+value, so they must be real addresses *inside the emulated process*.
+
+The dispatcher status is written to payload[0:4] as a big-endian i32; a negative
+status means the operation failed and ``payload[0:4]`` holds the error code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import struct
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+
+from .harness import EmulationError, Harness, MachOImage  # noqa: E402
+from .stubs import MacStubs  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[2]
+COREADI = Path(
+    os.environ.get("COREADI_PATH")
+    or ROOT
+    / "ext/itunes/mac/coreadi-pkg/rootfs/System/Library/PrivateFrameworks"
+    / "CoreADI.framework/Versions/A/CoreADI.x86_64"
+)
+
+# _vdfut768ig is at a different offset in every build, so the offset is looked up from the sha256
+# of the file actually loaded. A build that is not listed is refused rather than run at a wrong
+# entry point; COREADI_DISPATCH=0x... overrides the lookup for trying a new one.
+BUILDS = {
+    "2eafc3c79c7f41a8afbfbeaaf23ee5dab5ad5bda55ec8e54dbc0ddf1d20ce630": ("iTunes 12.8.3, CoreADI 4.19 (x86_64 slice)", 0x979A0),
+    "6fe4b27f2d75b5f365917a92389bed75542f3ba08197f136262be3b34d19cb5c": ("macOS 15.8.1 24H32 (fat file)", 0x17BF60),
+}
+
+
+def identify_build(data: bytes) -> tuple[str, int]:
+    """(name, dispatcher offset) for a CoreADI image; raises if the build is unknown."""
+    digest = hashlib.sha256(data).hexdigest()
+    override = os.environ.get("COREADI_DISPATCH")
+    if override:
+        return BUILDS.get(digest, ("unlisted build", 0))[0], int(override, 0)
+    if digest not in BUILDS:
+        raise EmulationError(f"unknown CoreADI build sha256 {digest}; set COREADI_DISPATCH to its _vdfut768ig offset")
+    return BUILDS[digest]
+
+
+# Function codes (Dadoum/apple-crates, `adi/src/calls.rs`).
+MAGIC = {
+    "Initialize": 0x12DB31C5,
+    "TearDown": 0x08C0FE9E,
+    "IsMachineProvisioned": 0xB0EDA7AF,
+    "GetAllProvisionedAccounts": 0x72096FE6,
+    "ProvisioningStart": 0x716BD86C,
+    "ProvisioningEnd": 0x0B2B3196,
+    "SessionDestroy": 0x55A637C0,
+    "SetIDMSRouting": 0x632B8D6E,
+    "GetIDMSRouting": 0x85FE63B0,
+    "Synchronize": 0xA54951EC,
+    "Erase": 0x7715488C,
+    "RequestOTP": 0xCFE0B46A,
+    "StorageDispose": 0x3E58E7F9,
+    "AccountsDispose": 0x9679D4B5,
+    "Gen2FACode": 0x385B2CE8,
+    # Android-only (present here only to confirm they are *absent* on macOS).
+    "SetAndroidID": 0xC774D292,
+    "SetProvisioningPath": 0xB23C691E,
+}
+
+# Known dispatcher/operation error codes.
+ERR_NOT_PROVISIONED = -45061
+ERR_GENERIC = -45002
+
+
+def w32(value: int) -> bytes:
+    return struct.pack(">I", value & 0xFFFFFFFF)
+
+
+def w64(value: int) -> bytes:
+    return struct.pack(">Q", value & 0xFFFFFFFFFFFFFFFF)
+
+
+def wi64(value: int) -> bytes:
+    return struct.pack(">q", value)
+
+
+def s32(value: int) -> int:
+    return value - 0x1_0000_0000 if value >= 0x8000_0000 else value
+
+
+@dataclass
+class Result:
+    name: str
+    rc: int
+    ret: int
+    outputs: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.rc >= 0 and self.ret >= 0
+
+    def __str__(self) -> str:
+        status = "ok " if self.ok else "ERR"
+        out = " ".join(f"{k}={v}" for k, v in self.outputs.items())
+        return f"{self.name:24} {status} rc={self.rc:>7} ret={self.ret:>7} {out}".rstrip()
+
+
+class CoreADI:
+    """A live Mac ADI dispatcher running on a synthetic macOS."""
+
+    def __init__(self, path: Path = COREADI, *, log: bool = False) -> None:
+        image = MachOImage(str(path))
+        self.build, self.dispatch = identify_build(image.data)
+        self.harness = Harness(image)
+        self.stubs = MacStubs(self.harness, log=log)
+        self.last_insns = 0
+
+    # -- low level --------------------------------------------------------
+    def _dispatch(self, name: str, message: bytes) -> tuple[int, int, int]:
+        h = self.harness
+        buf = bytearray(max(0x800, 8 + len(message)))
+        buf[3] = 1  # encryption_type = Clear
+        buf[7] = 1  # marker = 1
+        buf[8 : 8 + len(message)] = message
+        buf_addr = h.scratch(len(buf))
+        h.mem_write(buf_addr, bytes(buf))
+
+        params = h.scratch(0x20)
+        h.mem_write(params, b"\x00" * 0x20)
+        h.write_u64(params + 0x00, buf_addr)
+        h.write_u32(params + 0x08, 8 + len(message))
+        h.write_u32(params + 0x0C, 4)
+        h.write_u32(params + 0x10, 0)
+
+        rc = s32(h.invoke(self.dispatch, [MAGIC[name], params]))
+        ret = struct.unpack(">i", h.mem_read(buf_addr, 4))[0]
+        h.mem_write(buf_addr + 4, b"\x00" * 4)
+        return rc, ret, buf_addr
+
+    def _out_ptr(self, value: int = 0) -> int:
+        """A fresh 8-byte cell whose address can be handed to the dispatcher."""
+        addr = self.harness.scratch(8)
+        self.harness.write_u64(addr, value)
+        return addr
+
+    def _out_u32(self, value: int = 0) -> int:
+        addr = self.harness.scratch(8)
+        self.harness.write_u32(addr, value)
+        return addr
+
+    def _read_u64(self, addr: int) -> int:
+        return self.harness.read_u64(addr)
+
+    def _read_u32(self, addr: int) -> int:
+        return self.harness.read_u32(addr)
+
+    def _slice(self, ptr_addr: int, len_addr: int) -> bytes:
+        ptr = self._read_u64(ptr_addr)
+        length = self._read_u32(len_addr)
+        if not ptr or not length:
+            return b""
+        return bytes(self.harness.mem_read(ptr, length))
+
+    # -- operations -------------------------------------------------------
+    def initialize(self) -> Result:
+        rc, ret, _ = self._dispatch("Initialize", b"")
+        return Result("Initialize", rc, ret)
+
+    def teardown(self) -> Result:
+        rc, ret, _ = self._dispatch("TearDown", b"")
+        return Result("TearDown", rc, ret)
+
+    def is_machine_provisioned(self, ds_id: int) -> Result:
+        rc, ret, _ = self._dispatch("IsMachineProvisioned", wi64(ds_id))
+        return Result("IsMachineProvisioned", rc, ret, {"ds_id": ds_id})
+
+    def get_all_provisioned_accounts(self) -> Result:
+        list_ptr = self._out_ptr()
+        list_len = self._out_u32()
+        rc, ret, _ = self._dispatch(
+            "GetAllProvisionedAccounts", w64(list_ptr) + w64(list_len)
+        )
+        return Result("GetAllProvisionedAccounts", rc, ret)
+
+    def request_otp(self, ds_id: int) -> Result:
+        mid_ptr, mid_len = self._out_ptr(), self._out_u32()
+        otp_ptr, otp_len = self._out_ptr(), self._out_u32()
+        rc, ret, _ = self._dispatch(
+            "RequestOTP",
+            wi64(ds_id)
+            + w64(mid_ptr)
+            + w64(mid_len)
+            + w64(otp_ptr)
+            + w64(otp_len),
+        )
+        mid_n, otp_n = self._read_u32(mid_len), self._read_u32(otp_len)
+        mid = self._slice(mid_ptr, mid_len)
+        otp = self._slice(otp_ptr, otp_len)
+        # The library hands back pointers into its own storage; release them so
+        # repeated calls in one process do not accumulate.
+        if mid and otp:
+            self.storage_dispose(self._read_u64(mid_ptr))
+        return Result(
+            "RequestOTP",
+            rc,
+            ret,
+            {
+                "mid_len": mid_n,
+                "otp_len": otp_n,
+                "mid": mid,
+                "otp": otp,
+            },
+        )
+
+    def provisioning_start(self, ds_id: int, spim: bytes = b"") -> Result:
+        spim_buf = self.harness.scratch(max(len(spim), 16))
+        if spim:
+            self.harness.mem_write(spim_buf, spim)
+        cpim_ptr, cpim_len = self._out_ptr(), self._out_u32()
+        session = self._out_u32()
+        rc, ret, _ = self._dispatch(
+            "ProvisioningStart",
+            wi64(ds_id)
+            + w64(spim_buf)
+            + w32(len(spim))
+            + w64(cpim_ptr)
+            + w64(cpim_len)
+            + w64(session),
+        )
+        return Result(
+            "ProvisioningStart",
+            rc,
+            ret,
+            {
+                "spim_len": len(spim),
+                "cpim_len": self._read_u32(cpim_len),
+                "session": self._read_u32(session),
+                "cpim": self._slice(cpim_ptr, cpim_len),
+                "session_id": self._read_u32(session),
+            },
+        )
+
+    def provisioning_end(self, session: int, ptm: bytes, tk: bytes) -> Result:
+        ptm_buf = self.harness.scratch(max(len(ptm), 16))
+        if ptm:
+            self.harness.mem_write(ptm_buf, ptm)
+        tk_buf = self.harness.scratch(max(len(tk), 16))
+        if tk:
+            self.harness.mem_write(tk_buf, tk)
+        rc, ret, _ = self._dispatch(
+            "ProvisioningEnd",
+            w32(session)
+            + w64(ptm_buf)
+            + w32(len(ptm))
+            + w64(tk_buf)
+            + w32(len(tk)),
+        )
+        return Result(
+            "ProvisioningEnd",
+            rc,
+            ret,
+            {"session": session, "ptm_len": len(ptm), "tk_len": len(tk)},
+        )
+
+    def synchronize(self, ds_id: int, sim: bytes) -> Result:
+        sim_buf = self.harness.scratch(max(len(sim), 16))
+        if sim:
+            self.harness.mem_write(sim_buf, sim)
+        mid_ptr, mid_len = self._out_ptr(), self._out_u32()
+        srm_ptr, srm_len = self._out_ptr(), self._out_u32()
+        rc, ret, _ = self._dispatch(
+            "Synchronize",
+            wi64(ds_id)
+            + w64(sim_buf)
+            + w32(len(sim))
+            + w64(mid_ptr)
+            + w64(mid_len)
+            + w64(srm_ptr)
+            + w64(srm_len),
+        )
+        return Result(
+            "Synchronize",
+            rc,
+            ret,
+            {
+                "mid_len": self._read_u32(mid_len),
+                "srm_len": self._read_u32(srm_len),
+                "mid": self._slice(mid_ptr, mid_len),
+                "srm": self._slice(srm_ptr, srm_len),
+            },
+        )
+
+    def storage_dispose(self, ptr: int) -> Result:
+        rc, ret, _ = self._dispatch("StorageDispose", w64(ptr))
+        return Result("StorageDispose", rc, ret)
+
+    def erase(self, ds_id: int) -> Result:
+        rc, ret, _ = self._dispatch("Erase", wi64(ds_id))
+        return Result("Erase", rc, ret)
+
+    def set_routing(self, ds_id: int, routing: int) -> Result:
+        rc, ret, _ = self._dispatch("SetIDMSRouting", wi64(ds_id) + w64(routing))
+        return Result("SetIDMSRouting", rc, ret, {"routing": routing})
+
+    def get_routing(self, ds_id: int) -> Result:
+        route = self._out_ptr()
+        rc, ret, _ = self._dispatch("GetIDMSRouting", wi64(ds_id) + w64(route))
+        return Result("GetIDMSRouting", rc, ret, {"routing": self._read_u64(route)})
+
+    def gen_2fa(self, ds_id: int) -> Result:
+        code = self._out_u32()
+        rc, ret, _ = self._dispatch("Gen2FACode", wi64(ds_id) + w64(code))
+        return Result("Gen2FACode", rc, ret, {"code": self._read_u32(code)})
+
+    # -- convenience ------------------------------------------------------
+    def __enter__(self) -> CoreADI:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        try:
+            self.teardown()
+        except EmulationError:
+            pass
+
+
+def _probe(args: argparse.Namespace) -> int:
+    adi = CoreADI(log=args.log)
+    ds_id = args.ds_id
+    steps = [
+        adi.initialize,
+        lambda: adi.is_machine_provisioned(ds_id),
+        lambda: adi.get_all_provisioned_accounts(),
+        lambda: adi.get_routing(ds_id),
+        lambda: adi.request_otp(ds_id),
+        lambda: adi.provisioning_start(ds_id),
+        lambda: adi.gen_2fa(ds_id),
+        adi.teardown,
+    ]
+    for step in steps:
+        try:
+            print(step())
+        except EmulationError as exc:  # noqa: BLE001
+            print(f"  FAILED: {exc}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--ds-id", type=int, default=-2, help="DSID (Grand Slam uses -2)")
+    ap.add_argument("--log", action="store_true", help="log the synthetic syscalls")
+    return _probe(ap.parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''',
+    'LICENSE': r'''MIT License
+
+Copyright (c) 2026 sacca
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+''',
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Apple-Konto
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1082,30 +3179,54 @@ class Apple:
         self.account: Any = None
         self.methods: list[Any] = []
         self.path = DATA_DIR / "apple_account.json"
-        self.libs = DATA_DIR / "anisette_libs.bin"
         self.error: str | None = None
         self.lock = asyncio.Lock()
+        self.runtime = AppleRuntime()
 
     def _provider(self) -> Any:
-        from findmy import LocalAnisetteProvider, RemoteAnisetteProvider
-        url = (self.st.store.settings().get("anisette_server") or "").strip()
-        if url:
-            return RemoteAnisetteProvider(url)
-        return LocalAnisetteProvider(libs_path=self.libs)
+        from findmy import LocalAnisetteProvider
+        if (self.st.store.settings().get("anisette_server") or "").strip():
+            # Anisette-Server liefern eine Android-Identität – die lehnt Apple seit Okt. 2026 ab.
+            log.info("Anisette-Server wird ignoriert: Apple verlangt eine macOS-Identität.")
+        return LocalAnisetteProvider()
+
+    def _need_runtime(self) -> None:
+        if self.runtime.check():
+            return
+        if self.runtime.state == "missing":
+            self.runtime.start_install()
+        if self.runtime.state == "installing":
+            raise ValueError(f"Die macOS-Komponente für die Apple-Anmeldung wird gerade eingerichtet "
+                             f"({int(self.runtime.progress * 100)} %). Bitte in ein paar Minuten erneut anmelden.")
+        raise ValueError(self.runtime.message or "macOS-Komponente für die Apple-Anmeldung fehlt.")
 
     async def restore(self) -> None:
         from findmy import AsyncAppleAccount, LoginState
+        if not self.runtime.check() and self.runtime.state == "missing":
+            self.runtime.start_install()
         if not self.path.exists():
             return
+        if not apple_session_is_mac(self.path):
+            # Alte Android-Sitzung: liefert keine Standorte mehr → einmal neu anmelden
+            self.error = ("Apple hat die Anmeldung im Oktober 2026 umgestellt. Bitte einmal neu anmelden "
+                          "(Objekte, Schlüssel und Verlauf bleiben erhalten).")
+            log.warning("Gespeicherte Apple-Sitzung nutzt die alte Android-Identität – neue Anmeldung nötig.")
+            return
+        if self.runtime.state != "ready":
+            self.error = "Apple-Sitzung wartet auf die macOS-Komponente …"
+            return
         try:
-            acc = AsyncAppleAccount.from_json(self.path, anisette_libs_path=self.libs)
+            acc = AsyncAppleAccount.from_json(self.path)
+            acc._http = apple_http_session(acc._anisette)
             if acc.login_state == LoginState.LOGGED_IN:
                 self.account = acc
+                self.error = None
                 log.info("Apple-Konto wiederhergestellt: %s", acc.account_name)
             else:
                 await acc.close()
         except Exception as e:  # noqa: BLE001
             log.warning("Gespeicherte Apple-Sitzung unbrauchbar: %s", e)
+            self.error = "Gespeicherte Apple-Sitzung unbrauchbar – bitte neu anmelden."
 
     @property
     def logged_in(self) -> bool:
@@ -1114,12 +3235,13 @@ class Apple:
 
     def status(self) -> dict:
         if self.account is None:
-            return {"state": "logged_out", "error": self.error}
+            return {"state": "logged_out", "error": self.error, "runtime": self.runtime.status()}
         from findmy import LoginState
         s = self.account.login_state
         out: dict = {"state": {LoginState.LOGGED_OUT: "logged_out", LoginState.REQUIRE_2FA: "require_2fa",
                                LoginState.AUTHENTICATED: "authenticated",
-                               LoginState.LOGGED_IN: "logged_in"}[s], "error": self.error}
+                               LoginState.LOGGED_IN: "logged_in"}[s], "error": self.error,
+                     "runtime": self.runtime.status()}
         if s == LoginState.LOGGED_IN:
             with contextlib.suppress(Exception):
                 out.update(account_name=self.account.account_name, first_name=self.account.first_name,
@@ -1154,7 +3276,10 @@ class Apple:
                 with contextlib.suppress(Exception):
                     await self.account.close()
             self.account, self.methods, self.error = None, [], None
-            acc = AsyncAppleAccount(anisette=self._provider())
+            self._need_runtime()
+            provider = self._provider()
+            acc = AsyncAppleAccount(anisette=provider)
+            acc._http = apple_http_session(provider)
             try:
                 state = await acc.login(email.strip(), password)
             except Exception as e:  # noqa: BLE001
@@ -1167,8 +3292,19 @@ class Apple:
                 self.methods = list(await acc.get_2fa_methods())
                 # Vertrauenswürdige Geräte bekommen den Code meist automatisch – trotzdem anfordern
             elif state == LoginState.LOGGED_IN:
-                self.save()
+                self._finish()
             return self.status()
+
+    def _finish(self) -> None:
+        """Nach erfolgreicher Anmeldung: Ortungs-Token prüfen und Sitzung speichern."""
+        self.methods = []
+        if not apple_has_search_token(self.account):
+            self.error = ("Angemeldet, aber Apple hat keinen Ortungs-Token geliefert. Bitte später erneut "
+                          "anmelden – sonst können keine Standorte abgerufen werden.")
+            log.warning("Apple-Anmeldung ohne searchPartyToken.")
+        else:
+            self.error = None
+        self.save()
 
     async def request_code(self, index: int) -> None:
         await self.methods[index].request()
@@ -1178,8 +3314,7 @@ class Apple:
         async with self.lock:
             state = await self.methods[index].submit(code.strip())
             if state == LoginState.LOGGED_IN:
-                self.methods = []
-                self.save()
+                self._finish()
                 self.st.wake(full=True)
             return self.status()
 
@@ -1188,7 +3323,7 @@ class Apple:
             if self.account is not None:
                 with contextlib.suppress(Exception):
                     await self.account.close()
-            self.account, self.methods = None, []
+            self.account, self.methods, self.error = None, [], None
             with contextlib.suppress(FileNotFoundError):
                 self.path.unlink()
 
@@ -4503,15 +6638,33 @@ def build_app(st: State) -> web.Application:
             st.store.save_settings(s)
         try:
             res = await st.apple.login(b["email"], b["password"])
+        except ValueError as e:
+            st.set_status()
+            return jerr(503, str(e))
         except Exception as e:  # noqa: BLE001
             from findmy import InvalidCredentialsError
+            text = str(e)
+            if isinstance(e, InvalidCredentialsError) and "verification failed" in text.lower():
+                msg = ("Apple hat die Anmeldung abgelehnt („Email verification failed“). Bitte prüfen, ob die "
+                       "macOS-Komponente bereit ist, und es in ein paar Minuten noch einmal versuchen – nicht "
+                       "mehrfach direkt hintereinander, sonst sperrt Apple das Konto vorübergehend.")
+                st.apple.error = msg
+                return jerr(401, msg)
             if isinstance(e, InvalidCredentialsError):
                 return jerr(401, "Apple-ID oder Passwort falsch")
+            if "503" in text:
+                return jerr(502, "Apple-Anmeldeserver antwortet gerade nicht (503). Bitte später erneut versuchen.")
             return jerr(502, f"Apple-Anmeldung fehlgeschlagen: {type(e).__name__}: {e}")
         if res["state"] == "logged_in":
             st.wake(full=True)
         st.set_status()
         return web.json_response(res)
+
+    async def apple_runtime_install(_: web.Request) -> web.Response:
+        need_real()
+        if not st.apple.runtime.check():
+            st.apple.runtime.start_install()
+        return web.json_response(st.apple.status())
 
     async def apple_2fa_request(req: web.Request) -> web.Response:
         need_real()
@@ -5190,6 +7343,7 @@ def build_app(st: State) -> web.Application:
     r.add_delete("/api/notifications", notifications_clear)
     r.add_get("/api/apple/status", apple_status)
     r.add_post("/api/apple/login", apple_login)
+    r.add_post("/api/apple/runtime/install", apple_runtime_install)
     r.add_post("/api/apple/2fa/request", apple_2fa_request)
     r.add_post("/api/apple/2fa/submit", apple_2fa_submit)
     r.add_post("/api/apple/logout", apple_logout)
