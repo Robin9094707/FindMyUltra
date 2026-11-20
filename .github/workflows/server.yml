@@ -31,13 +31,15 @@ jobs:
       - name: Syntax prüfen
         run: python -m py_compile server/findmy_ultra.py
 
-      - name: Abhängigkeiten
-        run: pip install -q "findmy>=0.10.2" "aiohttp>=3.9.5,<4"
+      - name: Abhängigkeiten über den eingebauten Bootstrap installieren
+        run: |
+          python server/findmy_ultra.py --help > /dev/null
+          server/.venv/bin/python -c "import findmy, anisette; from findmy.reports.anisette import BaseAnisetteProvider as B; assert hasattr(B, 'get_client_info') and hasattr(anisette, 'AsyncAnisetteProvider'); print('Apple-Kompatibilität ok')"
 
       - name: Demo-Server starten und API testen
         run: |
           set -e
-          python server/findmy_ultra.py --demo --no-bootstrap --port 5071 --data /tmp/fmu > /tmp/fmu.log 2>&1 &
+          server/.venv/bin/python server/findmy_ultra.py --demo --no-bootstrap --port 5071 --data /tmp/fmu > /tmp/fmu.log 2>&1 &
           for i in $(seq 1 30); do curl -sf localhost:5071/api/health >/dev/null && break; sleep 1; done
           PW=$(grep -oP 'Passwort: \K\S+' /tmp/fmu/ERSTES-PASSWORT.txt)
           TOKEN=$(curl -sf localhost:5071/api/auth/login -H 'Content-Type: application/json' \

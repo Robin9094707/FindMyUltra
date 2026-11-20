@@ -114,7 +114,27 @@ struct AppleStatus: Codable, Hashable {
     var firstName: String?
     var lastName: String?
     var methods: [TwoFAMethod]?
+    /// 1.7.3: macOS-Komponente für die Apple-Anmeldung (tolerant, darf fehlen)
+    var runtime: AppleRuntimeStatus?
     var isLoggedIn: Bool { state == "logged_in" }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = (try? c.decode(String.self, forKey: .state)) ?? "logged_out"
+        error = (try? c.decodeIfPresent(String.self, forKey: .error)) ?? nil
+        accountName = (try? c.decodeIfPresent(String.self, forKey: .accountName)) ?? nil
+        firstName = (try? c.decodeIfPresent(String.self, forKey: .firstName)) ?? nil
+        lastName = (try? c.decodeIfPresent(String.self, forKey: .lastName)) ?? nil
+        methods = (try? c.decodeIfPresent([TwoFAMethod].self, forKey: .methods)) ?? nil
+        runtime = (try? c.decodeIfPresent(AppleRuntimeStatus.self, forKey: .runtime)) ?? nil
+    }
+}
+
+struct AppleRuntimeStatus: Codable, Hashable {
+    var state: String?
+    var message: String?
+    var progress: Double?
+    var isReady: Bool { state == "ready" }
 }
 
 struct ServerStatus: Codable, Hashable {

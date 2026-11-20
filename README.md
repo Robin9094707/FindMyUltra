@@ -4,8 +4,8 @@ Lückenlose Ortung und Standortverlauf für deine **eigenen** AirTags, Apple-Ger
 
 | Teil | Was | Version |
 |---|---|---|
-| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.2 |
-| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.2 |
+| `server/findmy_ultra.py` | **Eine einzige Python-Datei.** Holt Standortberichte über das Wo-ist-Netzwerk ([FindMy.py](https://github.com/malmeloo/FindMy.py)) und optional die Online-Standorte deiner Apple-Geräte über iCloud ([pyicloud](https://github.com/timlaing/pyicloud)). Speichert alles in SQLite, stellt eine API und eine Web-App bereit und schickt Alarme über **Bark**. Seit 1.7 zusätzlich Samsung SmartThings Find und Google Find Hub (Server-Fallback). | 1.7.3 |
+| `ios/` | **iOS-App** in SwiftUI mit Liquid Glass (iOS 26) und Apple Karten, aufgebaut wie Apples „Wo ist?“. Wird per GitHub-Action als **unsignierte IPA** gebaut und per Sideloading installiert. Google Find Hub läuft direkt auf dem iPhone. | 1.7.3 |
 
 > Das Projekt extrahiert keine Schlüssel. Du importierst deine vorhandenen JSON- oder plist-Schlüsseldateien.
 > Es nutzt inoffizielle Apple-Schnittstellen, die sich jederzeit ändern können. Verwende es nur für deine eigenen Geräte.
@@ -158,6 +158,20 @@ Unter der Server-Adresse findest du Karte, Verlauf mit Zeitleiste, Apple-Login, 
 
 ---
 
+## Apple-Anmeldung seit Oktober 2026 (1.7.3)
+
+Seit etwa 12.10.2026 lehnt Apple Anmeldungen mit der bisherigen Android-Identität ab. Typische Meldung: „Email verification failed: This action could not be completed“, oder es fehlt danach der Ortungs-Token. Siehe [FindMy.py #278](https://github.com/malmeloo/FindMy.py/issues/278).
+
+**Ab 1.7.3 meldet sich der Server mit einer Mac-Identität an.** Das passiert automatisch:
+
+1. Beim ersten Start aktualisiert der Server seine Pakete in `./.venv`. Er nutzt die Kompatibilitäts-Stände aus FindMy.py PR #279 und Anisette.py PR #6, mit festen Commits, ohne git.
+2. Einmalig lädt er Apples offiziellen iTunes-12.8.3-Installer (~290 MB) direkt von Apple. Daraus holt er die Anmelde-Komponente `CoreADI` und prüft beide SHA-256-Summen. Gespeichert wird nur die Komponente (`data/apple_adi/`, ~1,6 MB), der Installer wird wieder gelöscht. 7-Zip ist nicht nötig. Den Fortschritt zeigt die App unter Ich → Netzwerke → Apple.
+3. In der App **einmal neu bei Apple anmelden** und die Zwei-Faktor-Bestätigung abschließen. Objekte, Schlüssel und Verlauf bleiben erhalten.
+
+Die Komponente läuft in einem x86-Emulator (Unicorn) und funktioniert daher auch auf ARM-Servern. Wer schon eine geprüfte `CoreADI.x86_64` hat, z. B. aus RJ TrackerApp `runtime/`, kann den Download sparen: Umgebungsvariable `FMU_MACOS_ADI=/pfad/CoreADI.x86_64` setzen. Ein eingetragener Anisette-Server wird nicht mehr verwendet, weil er eine Android-Identität liefert.
+
+Bei Fehlern **nicht mehrfach direkt hintereinander** anmelden, sonst sperrt Apple das Konto vorübergehend.
+
 ## Google & Samsung (1.7)
 
 **Neu in 1.7.2:** Google-Tracker lassen sich wieder direkt am iPhone orten, auch wenn die Google-Anmeldung aus einer früheren Version stammt. Fehlt der Google-Zugang, sagt die App das jetzt klar, statt „0 neue Standorte“ zu melden.
@@ -196,7 +210,8 @@ Der Server braucht fast nur **ausgehendes HTTPS (TCP 443)**.
 | eingehend | Server | **5070** TCP | App und Web-App |
 | ausgehend | `gsa.apple.com`, `setup.icloud.com`, `gateway.icloud.com` | 443 | Apple-Login und Offline-Standorte |
 | ausgehend | `idmsa.apple.com`, `*.icloud.com` | 443 | Online-Ortung (iCloud „Geräte suchen“) |
-| ausgehend | `anisette.dl.mikealmel.ooo` | 443 | einmalig beim ersten Login |
+| ausgehend | `secure-appldnld.apple.com` | 443 | einmalig: Apple-Installer für die Mac-Anmeldung (~290 MB, 1.7.3) |
+| ausgehend | `github.com`, `codeload.github.com` | 443 | Installation der Python-Pakete (FindMy.py/Anisette-Kompatibilität) |
 | ausgehend | `api.day.app` oder eigener Bark-Server | 443 | Push-Benachrichtigungen |
 | ausgehend | `nominatim.openstreetmap.org` | 443 | Adressen in Mitteilungen (optional) |
 | ausgehend | `pypi.org`, `files.pythonhosted.org` | 443 | Installation und Updates der Pakete |

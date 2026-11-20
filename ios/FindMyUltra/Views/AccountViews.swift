@@ -51,29 +51,63 @@ struct AppleAccountView: View {
         }
         .navigationTitle("Apple-Account")
         .task { await reload() }
+        .task(id: apple?.runtime?.state) {
+            // Während die macOS-Komponente eingerichtet wird, Fortschritt nachladen
+            while apple?.runtime?.state == "installing" && !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                await reload()
+            }
+        }
         .disabled(busy)
         .overlay { if busy { ProgressView().controlSize(.large).padding(30).glassEffect(.regular, in: .rect(cornerRadius: 24)) } }
     }
 
+    /// Status der macOS-Komponente (seit Okt. 2026 für die Apple-Anmeldung nötig).
+    @ViewBuilder
+    private func runtimeSection(_ r: AppleRuntimeStatus?) -> some View {
+        if let r, !r.isReady {
+            Section {
+                switch r.state ?? "" {
+                case "installing":
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("macOS-Komponente wird eingerichtet", systemImage: "arrow.down.circle")
+                            .font(.headline)
+                        ProgressView(value: r.progress ?? 0)
+                        Text(r.message ?? "").font(.caption).foregroundStyle(.secondary)
+                    }
+                default:
+                    Label(r.message ?? "macOS-Komponente fehlt", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Button("Jetzt einrichten") { Task { await installRuntime() } }
+                }
+            } header: {
+                Text("Vorbereitung")
+            } footer: {
+                Text("Apple akzeptiert seit Oktober 2026 nur noch Anmeldungen mit einer Mac-Identität. Dein Server lädt dafür einmalig Apples offiziellen iTunes-Installer (~290 MB) und nutzt daraus die Anmelde-Komponente. Danach geht die Anmeldung wie gewohnt.")
+            }
+        }
+    }
+
+    private func installRuntime() async {
+        await run {
+            apple = try await model.api!.send("POST", "/api/apple/runtime/install")
+        }
+    }
+
     @ViewBuilder
     private func loginForm(_ a: AppleStatus) -> some View {
+        runtimeSection(a.runtime)
         Section {
             TextField("Apple-ID (E-Mail)", text: $email)
                 .textContentType(.username).keyboardType(.emailAddress)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
             SecureField("Passwort", text: $password).textContentType(.password)
             Button("Bei Apple anmelden") { Task { await login() } }
-                .disabled(email.isEmpty || password.isEmpty)
+                .disabled(email.isEmpty || password.isEmpty || !(a.runtime?.isReady ?? true))
         } header: {
             Text("Anmelden")
         } footer: {
-            Text("Die Zugangsdaten gehen nur an deinen eigenen Server, der sich damit bei Apple anmeldet (wie FindMy.py). Danach folgt die Zwei-Faktor-Bestätigung über ein vertrauenswürdiges Gerät oder per SMS.")
-        }
-        Section {
-            TextField("Anisette-Server (optional)", text: $anisette)
-                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-        } footer: {
-            Text("Leer lassen = lokale Anisette-Erzeugung auf dem Server. Alternativ z. B. einen eigenen anisette-v3-Server angeben.")
+            Text("Die Zugangsdaten gehen nur an deinen eigenen Server, der sich damit bei Apple anmeldet (wie FindMy.py). Danach folgt die Zwei-Faktor-Bestätigung über ein vertrauenswürdiges Gerät oder per SMS. Bei einem Fehler nicht mehrfach direkt hintereinander versuchen – Apple sperrt sonst vorübergehend.")
         }
         if let e = a.error { Section { Text(e).foregroundStyle(.orange) } }
     }
@@ -124,7 +158,7 @@ struct AppleAccountView: View {
     private func login() async {
         await run {
             let s: AppleStatus = try await model.api!.send("POST", "/api/apple/login",
-                                                           json: ["email": email, "password": password, "anisette_server": anisette],
+                                                           json: ["email": email, "password": password, "anisette_server": ""],
                                                            timeout: 120)
             apple = s
             password = ""
